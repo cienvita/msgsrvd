@@ -111,6 +111,8 @@ STATIC_ASSERT(sizeof(uint16_t) == 2, uint16_t_size);
 STATIC_ASSERT(sizeof(uint32_t) == 4, uint32_t_size);
 STATIC_ASSERT(sizeof(uint64_t) == 8, uint64_t_size);
 STATIC_ASSERT(sizeof(size_t)   == 8, size_t_64bit);
+STATIC_ASSERT(sizeof(uintptr_t) == sizeof(void *), uintptr_holds_pointer);
+STATIC_ASSERT(sizeof(intptr_t)  == sizeof(void *), intptr_holds_pointer);
 STATIC_ASSERT(sizeof(span_t)   == 8, span_t_compact);
 
 #endif /* MSGSRVD_TYPES_H */
