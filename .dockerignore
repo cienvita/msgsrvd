@@ -1,0 +1,11 @@
+.git
+.gitattributes
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+LICENSE
+msgsrvd
+tiny
+tinye
+*.o
