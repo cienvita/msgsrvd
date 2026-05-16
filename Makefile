@@ -6,7 +6,10 @@ all: msgsrvd
 msgsrvd: src/server/main.c
 	$(CC) $(CFLAGS) -Isrc -o $@ $<
 
+debug: CFLAGS += -O0 -g -DMSGSRVD_DEBUG
+debug: msgsrvd
+
 clean:
 	rm -f msgsrvd
 
-.PHONY: all clean
+.PHONY: all debug clean
