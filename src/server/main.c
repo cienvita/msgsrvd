@@ -3,6 +3,7 @@
 #include "core/mem.h"
 #include "core/err.h"
 #include "core/debug.h"
+#include "sys/os.h"
 
 /* Static arena backing buffer, 4MB */
 #define ARENA_SIZE (4 * 1024 * 1024)
@@ -18,6 +19,11 @@ int main(int argc, char **argv)
 
     arena_init(&arena, arena_buf, ARENA_SIZE);
     err_init(&err);
+
+    {
+        const char hello[] = "msgsrvd: sys layer ok\n";
+        os_write_raw(1, hello, sizeof(hello) - 1);
+    }
 
     DBG_LOG("msgsrvd starting");
     DBG_LOG("arena: %d bytes", ARENA_SIZE);
