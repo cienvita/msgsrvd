@@ -9,5 +9,5 @@ RUN make tiny
 
 # Ship it in scratch. No libc, no shell, no /lib. Just the binary.
 FROM scratch
-COPY --from=build /src/tiny /tiny
+COPY --from=build /src/build/tiny /tiny
 ENTRYPOINT ["/tiny"]
