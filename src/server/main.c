@@ -4,6 +4,7 @@
 #include "core/err.h"
 #include "core/debug.h"
 #include "proto/msg.h"
+#include "proto/conn.h"
 #include "sys/os.h"
 
 /* Static arena backing buffer, 4MB */
@@ -91,6 +92,103 @@ int main(int argc, char **argv)
         }
 
         DBG_LOG("protocol header round-trip: ok");
+    }
+
+    /* Connection state machine self-tests */
+    {
+        static uint8_t         conn_buf[4096];
+        static uint8_t         wire[4096];
+        conn_t                 c;
+        conn_action_t          actions[4];
+        msg_header_t           h;
+        int32_t                n;
+        int32_t                i;
+        const char             payload_str[] = "hello";
+        int32_t                payload_len = (int32_t)sizeof(payload_str) - 1;
+
+        /* Case 1: one complete frame in a single feed */
+        conn_init(&c, conn_buf, (int32_t)sizeof(conn_buf));
+        h = msg_header_new(MSG_OP_WRITE, MSG_RECORD_NONE, MSG_FLAG_ACK_REQ,
+                           (uint32_t)payload_len, 0xAABB, 7);
+        msg_encode_header(wire, (int32_t)sizeof(wire), &h);
+        mem_copy(wire + MSG_HEADER_SIZE, (const uint8_t *)payload_str,
+                 payload_len);
+
+        conn_recv_append(&c, wire, MSG_HEADER_SIZE + payload_len);
+        n = conn_feed(&c, actions, 4);
+        if (n != 1 ||
+            actions[0].type != CONN_ACTION_FRAME ||
+            actions[0].u.frame.header.op != MSG_OP_WRITE ||
+            actions[0].u.frame.header.record_type != MSG_RECORD_NONE ||
+            actions[0].u.frame.header.sequence != 7 ||
+            actions[0].u.frame.payload_len != payload_len ||
+            mem_cmp(actions[0].u.frame.payload,
+                    (const uint8_t *)payload_str, payload_len) != 0 ||
+            c.buf_len != 0 ||
+            c.closed) {
+            DBG_LOG("conn case1: single-frame parse failed");
+            return 1;
+        }
+        DBG_LOG("conn case1: single-frame parse: ok");
+
+        /* Case 2: byte-at-a-time feed of the same wire */
+        conn_init(&c, conn_buf, (int32_t)sizeof(conn_buf));
+        for (i = 0; i < MSG_HEADER_SIZE + payload_len - 1; i++) {
+            conn_recv_append(&c, wire + i, 1);
+            n = conn_feed(&c, actions, 4);
+            if (n != 0 || c.closed) {
+                DBG_LOG("conn case2: unexpected emit at byte %d", i);
+                return 1;
+            }
+        }
+        /* Final byte, should complete the frame */
+        conn_recv_append(&c, wire + i, 1);
+        n = conn_feed(&c, actions, 4);
+        if (n != 1 ||
+            actions[0].type != CONN_ACTION_FRAME ||
+            actions[0].u.frame.payload_len != payload_len ||
+            c.buf_len != 0 ||
+            c.closed) {
+            DBG_LOG("conn case2: byte-at-a-time parse failed");
+            return 1;
+        }
+        DBG_LOG("conn case2: byte-at-a-time parse: ok");
+
+        /* Case 3: bad magic -> REPLY_ERR + CLOSE */
+        conn_init(&c, conn_buf, (int32_t)sizeof(conn_buf));
+        mem_zero(wire, MSG_HEADER_SIZE);
+        wire[0] = 0xDE; wire[1] = 0xAD; wire[2] = 0xBE; wire[3] = 0xEF;
+        conn_recv_append(&c, wire, MSG_HEADER_SIZE);
+        n = conn_feed(&c, actions, 4);
+        if (n != 2 ||
+            actions[0].type != CONN_ACTION_REPLY_ERR ||
+            actions[0].u.reply_err.code != MSG_ERR_BAD_MAGIC ||
+            actions[1].type != CONN_ACTION_CLOSE ||
+            !c.closed) {
+            DBG_LOG("conn case3: bad-magic path failed (n=%d)", n);
+            return 1;
+        }
+        DBG_LOG("conn case3: bad-magic close: ok");
+
+        /* Case 4: oversized payload -> PAYLOAD_TOO_BIG + CLOSE */
+        conn_init(&c, conn_buf, (int32_t)sizeof(conn_buf));
+        h = msg_header_new(MSG_OP_WRITE, MSG_RECORD_NONE, 0,
+                           /* bigger than buf_cap - HEADER_SIZE */
+                           (uint32_t)sizeof(conn_buf),
+                           0, 99);
+        msg_encode_header(wire, (int32_t)sizeof(wire), &h);
+        conn_recv_append(&c, wire, MSG_HEADER_SIZE);
+        n = conn_feed(&c, actions, 4);
+        if (n != 2 ||
+            actions[0].type != CONN_ACTION_REPLY_ERR ||
+            actions[0].u.reply_err.code != MSG_ERR_PAYLOAD_TOO_BIG ||
+            actions[0].u.reply_err.sequence != 99 ||
+            actions[1].type != CONN_ACTION_CLOSE ||
+            !c.closed) {
+            DBG_LOG("conn case4: oversized-payload path failed (n=%d)", n);
+            return 1;
+        }
+        DBG_LOG("conn case4: oversized-payload close: ok");
     }
 
     /* Error stack self-test */
