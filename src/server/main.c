@@ -5,6 +5,7 @@
 #include "core/debug.h"
 #include "proto/msg.h"
 #include "proto/conn.h"
+#include "io/uring.h"
 #include "sys/os.h"
 
 /* Static arena backing buffer, 4MB */
@@ -189,6 +190,38 @@ int main(int argc, char **argv)
             return 1;
         }
         DBG_LOG("conn case4: oversized-payload close: ok");
+    }
+
+    /* io_uring init/destroy self-test */
+    {
+        uring_t  ring;
+        err_t    uring_err;
+        result_t r;
+
+        err_init(&uring_err);
+        r = uring_init(&ring, &uring_err, 8);
+        if (!result_ok(r)) {
+            DBG_LOG("uring_init failed (errno=%d), skipping",
+                    uring_err.frames[0].detail.u.errno_val);
+        } else {
+            if (ring.ring_fd <= 0 ||
+                ring.sq_head == NULL || ring.sq_tail == NULL ||
+                ring.cq_head == NULL || ring.cq_tail == NULL ||
+                ring.sqes == NULL || ring.cqes == NULL) {
+                DBG_LOG("uring: ring pointers not populated");
+                uring_destroy(&ring);
+                return 1;
+            }
+            DBG_LOG("uring: init ok (fd=%d, sq=%u, cq=%u)",
+                    ring.ring_fd,
+                    *ring.sq_entries_ptr, *ring.cq_entries_ptr);
+            uring_destroy(&ring);
+            if (ring.ring_fd != -1) {
+                DBG_LOG("uring: destroy did not clear fd");
+                return 1;
+            }
+            DBG_LOG("uring: destroy ok");
+        }
     }
 
     /* Error stack self-test */
