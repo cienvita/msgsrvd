@@ -9,8 +9,8 @@
  *
  * WAL-centric: every mutation is a WAL record. The protocol has a
  * small fixed set of verbs (op) and routes to a projector by
- * record_type. New storage types (stream, KV, object, ...) are added
- * as new record_type values without changing the op set.
+ * record_type. New storage types are added as new record_type values
+ * without changing the op set.
  *
  * All integers are little-endian. x86-64 and AArch64 are natively
  * little-endian on all shipping Linux platforms, so there is no
