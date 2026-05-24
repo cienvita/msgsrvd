@@ -2,6 +2,11 @@ CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror
 STRIP   := strip
 BUILD   := build
+SRCDIR  := src
+
+# All .c under src/ except the standalone nolibc binaries.
+MSGSRVD_SRCS := $(shell find $(SRCDIR) -name '*.c' \
+                  -not -name 'tiny.c' -not -name 'tinye.c')
 
 # Size-optimised, no libc, no CRT, no startup files.
 # Drops unused sections, build-id, unwind tables, comment notes.
@@ -19,8 +24,8 @@ msgsrvd: $(BUILD)/msgsrvd
 tiny:    $(BUILD)/tiny
 tinye:   $(BUILD)/tinye
 
-$(BUILD)/msgsrvd: src/server/main.c | $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ $<
+$(BUILD)/msgsrvd: $(MSGSRVD_SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(MSGSRVD_SRCS)
 
 debug: CFLAGS += -O0 -g -DMSGSRVD_DEBUG
 debug: $(BUILD)/msgsrvd
