@@ -27,6 +27,8 @@
 #define SYS_fdatasync       75
 #define SYS_ftruncate       77
 #define SYS_mkdir           83
+#define SYS_unlink          87
+#define SYS_getdents64      217
 #define SYS_fallocate       285
 #define SYS_eventfd2        290
 #define SYS_io_uring_setup  425

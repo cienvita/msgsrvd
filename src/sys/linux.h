@@ -17,11 +17,25 @@
 #define O_APPEND    0x0400
 #define O_DIRECT    0x4000
 #define O_DSYNC     0x1000
+#define O_DIRECTORY 0x10000
 
 /* lseek() whence */
 #define SEEK_SET    0
 #define SEEK_CUR    1
 #define SEEK_END    2
+
+/*
+ * getdents64() directory entry. d_name is NUL-terminated and the record
+ * is d_reclen bytes; the next entry starts d_reclen bytes on. d_name
+ * sits at a fixed offset of 19 bytes from the start.
+ */
+typedef struct {
+    uint64_t    d_ino;
+    int64_t     d_off;
+    uint16_t    d_reclen;
+    uint8_t     d_type;
+    char        d_name[];
+} linux_dirent64_t;
 
 /* mmap() */
 #define PROT_READ   0x1

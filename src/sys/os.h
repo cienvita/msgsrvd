@@ -102,6 +102,30 @@ static inline result_t os_mkdir(err_t *e, const char *path, int32_t mode)
     return RESULT_OK;
 }
 
+static inline result_t os_unlink(err_t *e, const char *path)
+{
+    long r = sys_call1(SYS_unlink, (long)path);
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
+/* Read directory entries into buf (linux_dirent64_t records). Writes the
+ * number of bytes filled to *n_out; 0 means end of directory. */
+static inline result_t os_getdents64(err_t *e, int32_t fd, void *buf,
+                                     int32_t count, long *n_out)
+{
+    long r = sys_call3(SYS_getdents64, (long)fd, (long)buf, (long)count);
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *n_out = r;
+    return RESULT_OK;
+}
+
 /* ---- Memory mapping ---- */
 
 static inline result_t os_mmap(err_t *e, void *addr, size_t length,
