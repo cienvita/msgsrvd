@@ -18,6 +18,11 @@
 #define O_DIRECT    0x4000
 #define O_DSYNC     0x1000
 
+/* lseek() whence */
+#define SEEK_SET    0
+#define SEEK_CUR    1
+#define SEEK_END    2
+
 /* mmap() */
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2

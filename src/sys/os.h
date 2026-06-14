@@ -67,6 +67,41 @@ static inline result_t os_fallocate(err_t *e, int32_t fd, int32_t mode,
     return RESULT_OK;
 }
 
+static inline result_t os_ftruncate(err_t *e, int32_t fd, uint64_t length)
+{
+    long r = sys_call2(SYS_ftruncate, (long)fd, (long)length);
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
+/* Reposition the file offset. On success writes the resulting absolute
+ * offset to *off_out. */
+static inline result_t os_lseek(err_t *e, int32_t fd, int64_t offset,
+                                int32_t whence, int64_t *off_out)
+{
+    long r = sys_call3(SYS_lseek, (long)fd, (long)offset, (long)whence);
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *off_out = (int64_t)r;
+    return RESULT_OK;
+}
+
+/* Create a directory. EEXIST is left for the caller to interpret. */
+static inline result_t os_mkdir(err_t *e, const char *path, int32_t mode)
+{
+    long r = sys_call2(SYS_mkdir, (long)path, (long)mode);
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
 /* ---- Memory mapping ---- */
 
 static inline result_t os_mmap(err_t *e, void *addr, size_t length,
