@@ -6,6 +6,8 @@
 #include "core/debug.h"
 #include "proto/msg.h"
 #include "proto/conn.h"
+#include "store/wal.h"
+#include "store/wal_seg.h"
 #include "io/uring.h"
 #include "sys/os.h"
 
@@ -260,6 +262,111 @@ int main(int argc, char **argv)
         }
 
         DBG_LOG("crc32c: ok (0x%08x)", whole);
+    }
+
+    /* WAL record codec self-test */
+    {
+        static uint8_t  recbuf[256];
+        const char      payload_str[] = "wal-record-payload";
+        const int32_t   payload_len = (int32_t)sizeof(payload_str) - 1;
+        wal_rec_t       in;
+        wal_rec_t       out;
+        const uint8_t   *pl;
+        int32_t         total;
+        int32_t         got;
+
+        mem_zero((uint8_t *)&in, sizeof(in));
+        in.wal_seq = 0x0102030405060708ull;
+        in.partition_key = 0xAABBCCDDull;
+        in.client_seq = 7;
+        in.record_type = MSG_RECORD_NONE;
+        in.flags = MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC;
+
+        total = wal_encode_rec(recbuf, (int32_t)sizeof(recbuf), &in,
+                               (const uint8_t *)payload_str, payload_len);
+        if (total != wal_rec_size(payload_len)) {
+            DBG_LOG("wal: encode size wrong (got %d)", total);
+            return 1;
+        }
+
+        /* Round-trip decode */
+        got = wal_decode_rec(recbuf, total, &out, &pl);
+        if (got != total ||
+            out.magic != WAL_REC_MAGIC ||
+            out.len != (uint32_t)payload_len ||
+            out.wal_seq != in.wal_seq ||
+            out.partition_key != in.partition_key ||
+            out.client_seq != in.client_seq ||
+            out.record_type != in.record_type ||
+            out.flags != in.flags ||
+            mem_cmp(pl, (const uint8_t *)payload_str, payload_len) != 0) {
+            DBG_LOG("wal: record round-trip mismatch");
+            return 1;
+        }
+
+        /* A flipped payload byte must fail the crc */
+        recbuf[WAL_REC_HDR_SIZE] ^= 0x01;
+        if (wal_decode_rec(recbuf, total, &out, &pl) != 0) {
+            DBG_LOG("wal: corrupt payload not detected");
+            return 1;
+        }
+        recbuf[WAL_REC_HDR_SIZE] ^= 0x01;
+
+        /* A flipped header byte must fail the crc */
+        recbuf[8] ^= 0x01;
+        if (wal_decode_rec(recbuf, total, &out, &pl) != 0) {
+            DBG_LOG("wal: corrupt header not detected");
+            return 1;
+        }
+        recbuf[8] ^= 0x01;
+
+        /* A truncated buffer decodes to nothing */
+        if (wal_decode_rec(recbuf, total - 1, &out, &pl) != 0) {
+            DBG_LOG("wal: truncated record not rejected");
+            return 1;
+        }
+
+        /* Encode into too small a buffer fails cleanly */
+        if (wal_encode_rec(recbuf, WAL_REC_HDR_SIZE, &in,
+                           (const uint8_t *)payload_str, payload_len) != 0) {
+            DBG_LOG("wal: undersized encode not rejected");
+            return 1;
+        }
+
+        DBG_LOG("wal: record codec: ok (rec=%d bytes)", total);
+    }
+
+    /* WAL segment naming self-test */
+    {
+        char        name[WAL_SEG_NAME_LEN + 1];
+        uint64_t    seq;
+
+        wal_seg_name(0x2aull, name);
+        if (mem_cmp((const uint8_t *)name,
+                    (const uint8_t *)"000000000000002a.wal",
+                    WAL_SEG_NAME_LEN + 1) != 0) {
+            DBG_LOG("wal: segment name format wrong (%s)", name);
+            return 1;
+        }
+        if (!wal_seg_parse(name, &seq) || seq != 0x2aull) {
+            DBG_LOG("wal: segment name parse failed");
+            return 1;
+        }
+
+        /* Round-trip a large value */
+        wal_seg_name(0xDEADBEEFCAFEBABEull, name);
+        if (!wal_seg_parse(name, &seq) || seq != 0xDEADBEEFCAFEBABEull) {
+            DBG_LOG("wal: segment name round-trip failed");
+            return 1;
+        }
+
+        /* Reject a malformed name */
+        if (wal_seg_parse("000000000000002a.bad", &seq)) {
+            DBG_LOG("wal: malformed segment name accepted");
+            return 1;
+        }
+
+        DBG_LOG("wal: segment naming: ok");
     }
 
     /* Error stack self-test */
