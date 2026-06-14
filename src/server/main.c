@@ -218,6 +218,29 @@ int main(int argc, char **argv)
             DBG_LOG("uring: init ok (fd=%d, sq=%u, cq=%u)",
                     ring.ring_fd,
                     *ring.sq_entries_ptr, *ring.cq_entries_ptr);
+
+            /* Submit a NOP and harvest its completion synchronously */
+            {
+                io_uring_sqe_t *sqe = uring_get_sqe(&ring);
+                io_uring_cqe_t  cqe;
+                result_t        wr;
+
+                if (!sqe) {
+                    DBG_LOG("uring: no sqe for nop");
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                uring_prep_nop(sqe, 0xC0FFEEull);
+                wr = uring_wait_cqe(&ring, &uring_err, 1, &cqe);
+                if (!result_ok(wr) || cqe.user_data != 0xC0FFEEull ||
+                    cqe.res != 0) {
+                    DBG_LOG("uring: nop wait_cqe failed (res=%d)", cqe.res);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                DBG_LOG("uring: nop wait_cqe ok");
+            }
+
             uring_destroy(&ring);
             if (ring.ring_fd != -1) {
                 DBG_LOG("uring: destroy did not clear fd");

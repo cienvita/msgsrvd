@@ -137,6 +137,13 @@ io_uring_sqe_t *uring_get_sqe(uring_t *ring)
     ring->sq_array[idx] = idx;
 
     mem_zero((uint8_t *)sqe, (int32_t)sizeof(*sqe));
+
+    /*
+     * Reserve the slot by advancing the tail. The kernel only reads the
+     * tail at io_uring_enter time (in submit), and the caller fills the
+     * SQE before then, so the slot is complete by the time it is seen.
+     */
+    *ring->sq_tail = tail + 1;
     return sqe;
 }
 
@@ -187,6 +194,40 @@ result_t uring_submit_and_wait(uring_t *ring, err_t *e,
 
     if (submitted)
         *submitted = (uint32_t)r;
+    return RESULT_OK;
+}
+
+result_t uring_wait_cqe(uring_t *ring, err_t *e, uint32_t min_complete,
+                        io_uring_cqe_t *out)
+{
+    uint32_t tail = *ring->sq_tail;
+    uint32_t head = *ring->sq_head;
+    uint32_t to_submit = tail - head;
+    uint32_t cq_head;
+    long r;
+
+    io_barrier();
+    *ring->sq_tail = tail;
+    io_barrier();
+
+    r = sys_call4(SYS_io_uring_enter, (long)ring->ring_fd,
+                  (long)to_submit, (long)min_complete,
+                  IORING_ENTER_GETEVENTS);
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+
+    cq_head = *ring->cq_head;
+    io_barrier();
+    if (cq_head == *ring->cq_tail) {
+        ERR_PUSH(e, ERR_AGAIN);
+        return RESULT_ERR(ERR_AGAIN, 0);
+    }
+
+    *out = ring->cqes[cq_head & *ring->cq_mask];
+    *ring->cq_head = cq_head + 1;
+    io_barrier();
     return RESULT_OK;
 }
 

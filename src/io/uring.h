@@ -66,6 +66,16 @@ result_t uring_submit_and_wait(uring_t *ring, err_t *e,
 /* Process all available CQEs, calling cb for each. Returns count processed. */
 int32_t uring_reap(uring_t *ring, uring_cb_t cb);
 
+/*
+ * Submit pending SQEs, wait for at least min_complete completions, and
+ * copy the oldest CQE into *out, advancing the CQ head past it. For
+ * synchronous single-op callers (e.g. the WAL append path) that need the
+ * result directly rather than through a reap callback. Returns ERR_AGAIN
+ * if no completion is present after the wait.
+ */
+result_t uring_wait_cqe(uring_t *ring, err_t *e, uint32_t min_complete,
+                        io_uring_cqe_t *out);
+
 /* ---- SQE prep helpers ---- */
 
 static inline void uring_prep_accept(io_uring_sqe_t *sqe, int32_t fd,
@@ -159,6 +169,20 @@ static inline void uring_prep_fsync(io_uring_sqe_t *sqe, int32_t fd,
     sqe->addr = 0;
     sqe->len = 0;
     sqe->op_flags = fsync_flags;
+    sqe->user_data = user_data;
+    sqe->buf_index = 0;
+}
+
+static inline void uring_prep_nop(io_uring_sqe_t *sqe, uint64_t user_data)
+{
+    sqe->opcode = IORING_OP_NOP;
+    sqe->flags = 0;
+    sqe->ioprio = 0;
+    sqe->fd = -1;
+    sqe->off = 0;
+    sqe->addr = 0;
+    sqe->len = 0;
+    sqe->op_flags = 0;
     sqe->user_data = user_data;
     sqe->buf_index = 0;
 }
