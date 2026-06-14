@@ -2,6 +2,7 @@
 #include "core/arena.h"
 #include "core/mem.h"
 #include "core/err.h"
+#include "core/crc32.h"
 #include "core/debug.h"
 #include "proto/msg.h"
 #include "proto/conn.h"
@@ -222,6 +223,43 @@ int main(int argc, char **argv)
             }
             DBG_LOG("uring: destroy ok");
         }
+    }
+
+    /* crc32c self-test */
+    {
+        const char check_str[] = "123456789";
+        const int32_t check_len = (int32_t)sizeof(check_str) - 1;
+        uint32_t whole;
+        uint32_t split;
+        uint32_t flipped;
+        uint8_t mangled[9];
+
+        /* Standard CRC-32C check value */
+        whole = crc32c_buf((const uint8_t *)check_str, check_len);
+        if (whole != 0xE3069283u) {
+            DBG_LOG("crc32c: check value mismatch (got 0x%08x)", whole);
+            return 1;
+        }
+
+        /* Incremental update must match the single-shot result */
+        split = crc32c(CRC32C_INIT, (const uint8_t *)check_str, 4);
+        split = crc32c(split, (const uint8_t *)check_str + 4, check_len - 4);
+        split = crc32c_fin(split);
+        if (split != whole) {
+            DBG_LOG("crc32c: incremental != single-shot");
+            return 1;
+        }
+
+        /* A single flipped bit must change the crc */
+        mem_copy(mangled, (const uint8_t *)check_str, check_len);
+        mangled[0] ^= 0x01;
+        flipped = crc32c_buf(mangled, check_len);
+        if (flipped == whole) {
+            DBG_LOG("crc32c: flipped bit did not change crc");
+            return 1;
+        }
+
+        DBG_LOG("crc32c: ok (0x%08x)", whole);
     }
 
     /* Error stack self-test */
