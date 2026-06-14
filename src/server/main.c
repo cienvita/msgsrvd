@@ -8,6 +8,7 @@
 #include "proto/conn.h"
 #include "store/wal.h"
 #include "store/wal_seg.h"
+#include "store/wal_log.h"
 #include "io/uring.h"
 #include "sys/os.h"
 
@@ -390,6 +391,149 @@ int main(int argc, char **argv)
         }
 
         DBG_LOG("wal: segment naming: ok");
+    }
+
+    /* WAL log append self-test (needs io_uring + a writable dir) */
+    {
+        uring_t     ring;
+        err_t       wal_err;
+        result_t    r;
+
+        err_init(&wal_err);
+        r = uring_init(&ring, &wal_err, 8);
+        if (!result_ok(r)) {
+            DBG_LOG("wal log: uring init failed (errno=%d), skipping",
+                    wal_err.frames[0].detail.u.errno_val);
+        } else {
+            static uint8_t  scratch[512];
+            static uint8_t  readbuf[256];
+            wal_log_t       w;
+            wal_rec_t       meta;
+            uint64_t        seq;
+            const char      *plds[3];
+            int32_t         plens[3];
+            int32_t         i;
+            io_uring_sqe_t  *sqe;
+            io_uring_cqe_t  rcqe;
+            int32_t         off;
+
+            plds[0] = "alpha";  plens[0] = 5;
+            plds[1] = "beta";   plens[1] = 4;
+            plds[2] = "gamma";  plens[2] = 5;
+
+            mem_zero((uint8_t *)&meta, (int32_t)sizeof(meta));
+            meta.partition_key = 0x1234;
+            meta.record_type = MSG_RECORD_NONE;
+            meta.flags = MSG_FLAG_ACK_REQ;
+
+            r = wal_log_open(&w, &wal_err, "/tmp/msgsrvd-waltest", 4096, &ring,
+                             scratch, (int32_t)sizeof(scratch));
+            if (!result_ok(r)) {
+                DBG_LOG("wal log: open failed");
+                uring_destroy(&ring);
+                return 1;
+            }
+
+            for (i = 0; i < 3; i++) {
+                meta.client_seq = (uint64_t)(100 + i);
+                r = wal_log_append(&w, &wal_err, &meta,
+                                   (const uint8_t *)plds[i], plens[i],
+                                   TRUE, &seq);
+                if (!result_ok(r) || seq != (uint64_t)i) {
+                    DBG_LOG("wal log: append %d failed (code=%d)", i, r.code);
+                    wal_log_close(&w);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+            }
+
+            /* Read the segment back and decode every record */
+            sqe = uring_get_sqe(&ring);
+            uring_prep_read(sqe, w.active_fd, readbuf, (uint32_t)w.active_off,
+                            0, 0);
+            r = uring_wait_cqe(&ring, &wal_err, 1, &rcqe);
+            if (!result_ok(r) || rcqe.res != w.active_off) {
+                DBG_LOG("wal log: readback short (res=%d)", rcqe.res);
+                wal_log_close(&w);
+                uring_destroy(&ring);
+                return 1;
+            }
+
+            off = 0;
+            for (i = 0; i < 3; i++) {
+                wal_rec_t       rec;
+                const uint8_t   *pl;
+                int32_t         got = wal_decode_rec(readbuf + off,
+                                                     w.active_off - off,
+                                                     &rec, &pl);
+                if (got <= 0 ||
+                    rec.wal_seq != (uint64_t)i ||
+                    rec.client_seq != (uint64_t)(100 + i) ||
+                    rec.len != (uint32_t)plens[i] ||
+                    mem_cmp(pl, (const uint8_t *)plds[i], plens[i]) != 0) {
+                    DBG_LOG("wal log: readback record %d mismatch", i);
+                    wal_log_close(&w);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                off += got;
+            }
+            wal_log_close(&w);
+            DBG_LOG("wal log: append + readback: ok (3 records, %d bytes)",
+                    w.active_off);
+
+            /* Segment rollover: a tiny segment forces a new file */
+            {
+                wal_log_t   w2;
+
+                r = wal_log_open(&w2, &wal_err, "/tmp/msgsrvd-waltest2", 64, &ring,
+                                 scratch, (int32_t)sizeof(scratch));
+                if (!result_ok(r)) {
+                    DBG_LOG("wal log: rollover open failed");
+                    uring_destroy(&ring);
+                    return 1;
+                }
+
+                r = wal_log_append(&w2, &wal_err, &meta,
+                                   (const uint8_t *)"alpha", 5, TRUE, &seq);
+                if (!result_ok(r) || w2.active_base != 0) {
+                    DBG_LOG("wal log: rollover first append failed");
+                    wal_log_close(&w2);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+
+                /* Second record will not fit; must roll to base 1 */
+                r = wal_log_append(&w2, &wal_err, &meta,
+                                   (const uint8_t *)"beta", 4, TRUE, &seq);
+                if (!result_ok(r) || seq != 1 || w2.active_base != 1) {
+                    DBG_LOG("wal log: rollover did not advance (base=%llu)",
+                            (unsigned long long)w2.active_base);
+                    wal_log_close(&w2);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+
+                /* A record larger than a whole segment is rejected */
+                {
+                    static uint8_t big[80];
+                    mem_set(big, 'x', (int32_t)sizeof(big));
+                    r = wal_log_append(&w2, &wal_err, &meta, big,
+                                       (int32_t)sizeof(big), FALSE, &seq);
+                    if (result_ok(r)) {
+                        DBG_LOG("wal log: oversize record not rejected");
+                        wal_log_close(&w2);
+                        uring_destroy(&ring);
+                        return 1;
+                    }
+                }
+
+                wal_log_close(&w2);
+                DBG_LOG("wal log: segment rollover: ok");
+            }
+
+            uring_destroy(&ring);
+        }
     }
 
     /* Error stack self-test */

@@ -49,6 +49,7 @@
 #define EINVAL      22
 #define ENOSPC      28
 #define EPIPE       32
+#define EOPNOTSUPP  95
 #define ECONNRESET  104
 #define ETIMEDOUT   110
 
