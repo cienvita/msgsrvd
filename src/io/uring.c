@@ -160,8 +160,8 @@ result_t uring_submit(uring_t *ring, err_t *e, uint32_t *submitted)
     *ring->sq_tail = tail;
     io_barrier();
 
-    r = sys_call4(SYS_io_uring_enter, (long)ring->ring_fd,
-                  (long)to_submit, 0, 0);
+    r = sys_call6(SYS_io_uring_enter, (long)ring->ring_fd,
+                  (long)to_submit, 0, 0, 0, 0);
     if (sys_is_err(r)) {
         ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
         return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
@@ -184,9 +184,9 @@ result_t uring_submit_and_wait(uring_t *ring, err_t *e,
     *ring->sq_tail = tail;
     io_barrier();
 
-    r = sys_call4(SYS_io_uring_enter, (long)ring->ring_fd,
+    r = sys_call6(SYS_io_uring_enter, (long)ring->ring_fd,
                   (long)to_submit, (long)min_complete,
-                  IORING_ENTER_GETEVENTS);
+                  IORING_ENTER_GETEVENTS, 0, 0);
     if (sys_is_err(r)) {
         ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
         return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
@@ -210,9 +210,9 @@ result_t uring_wait_cqe(uring_t *ring, err_t *e, uint32_t min_complete,
     *ring->sq_tail = tail;
     io_barrier();
 
-    r = sys_call4(SYS_io_uring_enter, (long)ring->ring_fd,
+    r = sys_call6(SYS_io_uring_enter, (long)ring->ring_fd,
                   (long)to_submit, (long)min_complete,
-                  IORING_ENTER_GETEVENTS);
+                  IORING_ENTER_GETEVENTS, 0, 0);
     if (sys_is_err(r)) {
         ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
         return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
