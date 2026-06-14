@@ -14,6 +14,26 @@ static void seg_path(const wal_log_t *w, uint64_t base, char *out)
     wal_seg_name(base, out + w->dir_len + 1);
 }
 
+/*
+ * Size a segment to seg_size. Preallocate so appends never
+ * extend-on-write; filesystems without fallocate (tmpfs, some network
+ * mounts) report EOPNOTSUPP, so fall back to ftruncate, which leaves the
+ * file sparse but keeps writes within a fixed length.
+ */
+static result_t prealloc(wal_log_t *w, err_t *e, int32_t fd)
+{
+    result_t r = os_fallocate(e, fd, 0, 0, (uint64_t)w->seg_size);
+    if (!result_ok(r)) {
+        if (r.detail != EOPNOTSUPP)
+            return r;
+        err_init(e);
+        r = os_ftruncate(e, fd, (uint64_t)w->seg_size);
+        if (!result_ok(r))
+            return r;
+    }
+    return RESULT_OK;
+}
+
 /* Open (creating if needed) and preallocate the segment for base. */
 static result_t open_segment(wal_log_t *w, err_t *e, uint64_t base,
                              int32_t *fd_out)
@@ -28,27 +48,169 @@ static result_t open_segment(wal_log_t *w, err_t *e, uint64_t base,
     if (!result_ok(r))
         return r;
 
-    /*
-     * Preallocate so appends never extend-on-write. Filesystems without
-     * fallocate (tmpfs, some network mounts) report EOPNOTSUPP; fall back
-     * to sizing the file with ftruncate, which leaves it sparse but keeps
-     * writes within a fixed length.
-     */
-    r = os_fallocate(e, fd, 0, 0, (uint64_t)w->seg_size);
+    r = prealloc(w, e, fd);
     if (!result_ok(r)) {
-        if (r.detail != EOPNOTSUPP) {
-            os_close(e, fd);
+        os_close(e, fd);
+        return r;
+    }
+
+    *fd_out = fd;
+    return RESULT_OK;
+}
+
+/* Read len bytes at off into buf via io_uring. Writes bytes read to *got. */
+static result_t read_at(wal_log_t *w, err_t *e, int32_t fd, uint8_t *buf,
+                        int32_t len, int64_t off, int32_t *got)
+{
+    io_uring_sqe_t *sqe;
+    io_uring_cqe_t  cqe;
+    result_t        r;
+
+    sqe = uring_get_sqe(w->ring);
+    if (!sqe) {
+        ERR_PUSH(e, ERR_AGAIN);
+        return RESULT_ERR(ERR_AGAIN, 0);
+    }
+    uring_prep_read(sqe, fd, buf, (uint32_t)len, (uint64_t)off, 0);
+    r = uring_wait_cqe(w->ring, e, 1, &cqe);
+    if (!result_ok(r))
+        return r;
+    if (cqe.res < 0) {
+        ERR_PUSH_INT(e, ERR_STORAGE, cqe.res);
+        return RESULT_ERR(ERR_STORAGE, cqe.res);
+    }
+    *got = cqe.res;
+    return RESULT_OK;
+}
+
+/*
+ * Scan the directory for segment files and report the highest base
+ * sequence. *found is FALSE when the directory holds no segments.
+ */
+static result_t scan_dir_max_base(wal_log_t *w, err_t *e,
+                                  uint64_t *max_base, bool_t *found)
+{
+    uint64_t dbuf[128];     /* 1 KiB dirent buffer, 8-byte aligned */
+    int32_t  dfd;
+    long     n;
+    result_t r;
+
+    *found = FALSE;
+    *max_base = 0;
+
+    r = os_open(e, w->dir, O_RDONLY | O_DIRECTORY, 0, &dfd);
+    if (!result_ok(r))
+        return r;
+
+    for (;;) {
+        int32_t bpos = 0;
+
+        r = os_getdents64(e, dfd, dbuf, (int32_t)sizeof(dbuf), &n);
+        if (!result_ok(r)) {
+            os_close(e, dfd);
             return r;
         }
-        err_init(e);
-        r = os_ftruncate(e, fd, (uint64_t)w->seg_size);
+        if (n == 0)
+            break;
+
+        while (bpos < (int32_t)n) {
+            linux_dirent64_t *ent =
+                (linux_dirent64_t *)((uint8_t *)dbuf + bpos);
+            uint64_t base;
+
+            if (wal_seg_parse(ent->d_name, &base)) {
+                if (!*found || base > *max_base) {
+                    *max_base = base;
+                    *found = TRUE;
+                }
+            }
+            bpos += ent->d_reclen;
+        }
+    }
+
+    return os_close(e, dfd);
+}
+
+/*
+ * Recover the highest segment: replay its records validating each crc,
+ * stop at the first torn or zero record, truncate that tail, and resume
+ * the append offset and next sequence from there.
+ */
+static result_t recover_segment(wal_log_t *w, err_t *e, uint64_t base)
+{
+    char     path[WAL_DIR_MAX + 1 + WAL_SEG_NAME_LEN + 1];
+    int32_t  fd;
+    int32_t  off = 0;
+    uint64_t next = base;
+    result_t r;
+
+    seg_path(w, base, path);
+    r = os_open(e, path, O_RDWR, 0, &fd);
+    if (!result_ok(r))
+        return r;
+
+    for (;;) {
+        int32_t        got = 0;
+        uint32_t       magic;
+        uint32_t       plen;
+        int32_t        total;
+        wal_rec_t      rec;
+        const uint8_t  *pl;
+
+        if (off + WAL_REC_HDR_SIZE > w->seg_size)
+            break;
+
+        r = read_at(w, e, fd, w->scratch, WAL_REC_HDR_SIZE, off, &got);
         if (!result_ok(r)) {
             os_close(e, fd);
             return r;
         }
+        if (got < WAL_REC_HDR_SIZE)
+            break;
+
+        mem_copy((uint8_t *)&magic, w->scratch, 4);
+        if (magic != WAL_REC_MAGIC)
+            break;
+        mem_copy((uint8_t *)&plen, w->scratch + 4, 4);
+        if (plen > (uint32_t)WAL_REC_MAX_LEN)
+            break;
+
+        total = wal_rec_size((int32_t)plen);
+        if (total > w->scratch_cap || off + total > w->seg_size)
+            break;
+
+        r = read_at(w, e, fd, w->scratch + WAL_REC_HDR_SIZE,
+                    total - WAL_REC_HDR_SIZE, off + WAL_REC_HDR_SIZE, &got);
+        if (!result_ok(r)) {
+            os_close(e, fd);
+            return r;
+        }
+        if (got < total - WAL_REC_HDR_SIZE)
+            break;
+
+        if (wal_decode_rec(w->scratch, total, &rec, &pl) != total)
+            break;
+
+        off += total;
+        next = rec.wal_seq + 1;
     }
 
-    *fd_out = fd;
+    /* Drop the torn tail, then restore the segment to full size. */
+    r = os_ftruncate(e, fd, (uint64_t)off);
+    if (!result_ok(r)) {
+        os_close(e, fd);
+        return r;
+    }
+    r = prealloc(w, e, fd);
+    if (!result_ok(r)) {
+        os_close(e, fd);
+        return r;
+    }
+
+    w->active_fd = fd;
+    w->active_base = base;
+    w->active_off = off;
+    w->next_seq = next;
     return RESULT_OK;
 }
 
@@ -112,6 +274,19 @@ result_t wal_log_open(wal_log_t *w, err_t *e, const char *dir,
         err_init(e);
     }
 
+    /* If segments already exist, recover from the highest one. */
+    {
+        uint64_t max_base;
+        bool_t   found;
+
+        r = scan_dir_max_base(w, e, &max_base, &found);
+        if (!result_ok(r))
+            return r;
+        if (found)
+            return recover_segment(w, e, max_base);
+    }
+
+    /* Fresh log: start at sequence 0. */
     r = open_segment(w, e, 0, &fd);
     if (!result_ok(r))
         return r;

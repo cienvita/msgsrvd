@@ -12,6 +12,28 @@
 #include "io/uring.h"
 #include "sys/os.h"
 
+/* Build "<dir>/<segname>" into out (self-test helper). */
+static void build_seg_path(const char *dir, uint64_t base, char *out)
+{
+    int32_t n = 0;
+    while (dir[n] != '\0')
+        n++;
+    mem_copy((uint8_t *)out, (const uint8_t *)dir, n);
+    out[n] = '/';
+    wal_seg_name(base, out + n + 1);
+}
+
+/* Remove one segment file so a self-test starts from a known state. */
+static void rm_seg(const char *dir, uint64_t base)
+{
+    char  path[300];
+    err_t e;
+
+    build_seg_path(dir, base, path);
+    err_init(&e);
+    os_unlink(&e, path);    /* a missing file is fine */
+}
+
 /* Static arena backing buffer, 4MB */
 #define ARENA_SIZE (4 * 1024 * 1024)
 static uint8_t arena_buf[ARENA_SIZE];
@@ -426,6 +448,7 @@ int main(int argc, char **argv)
             meta.record_type = MSG_RECORD_NONE;
             meta.flags = MSG_FLAG_ACK_REQ;
 
+            rm_seg("/tmp/msgsrvd-waltest", 0);
             r = wal_log_open(&w, &wal_err, "/tmp/msgsrvd-waltest", 4096, &ring,
                              scratch, (int32_t)sizeof(scratch));
             if (!result_ok(r)) {
@@ -482,10 +505,120 @@ int main(int argc, char **argv)
             DBG_LOG("wal log: append + readback: ok (3 records, %d bytes)",
                     w.active_off);
 
+            /* Recovery: reopen and confirm the scan resumes the log */
+            {
+                wal_log_t   wr;
+
+                r = wal_log_open(&wr, &wal_err, "/tmp/msgsrvd-waltest", 4096,
+                                 &ring, scratch, (int32_t)sizeof(scratch));
+                if (!result_ok(r) || wr.next_seq != 3 ||
+                    wr.active_base != 0 || wr.active_off != 144) {
+                    DBG_LOG("wal log: recovery state wrong "
+                            "(next=%llu base=%llu off=%d)",
+                            (unsigned long long)wr.next_seq,
+                            (unsigned long long)wr.active_base,
+                            wr.active_off);
+                    wal_log_close(&wr);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+
+                /* The next append continues the sequence */
+                r = wal_log_append(&wr, &wal_err, &meta,
+                                   (const uint8_t *)"delta", 5, TRUE, &seq);
+                if (!result_ok(r) || seq != 3) {
+                    DBG_LOG("wal log: post-recovery append failed");
+                    wal_log_close(&wr);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                wal_log_close(&wr);
+                DBG_LOG("wal log: recovery: ok (resumed at seq 3)");
+            }
+
+            /* Torn-tail recovery: garbage after the last record is dropped */
+            {
+                wal_log_t       wt;
+                char            tpath[300];
+                int32_t         tfd;
+                int32_t         tail_off;
+                static uint8_t  garbage[16];
+                io_uring_sqe_t  *gsqe;
+                io_uring_cqe_t  gcqe;
+
+                rm_seg("/tmp/msgsrvd-waltest3", 0);
+                r = wal_log_open(&wt, &wal_err, "/tmp/msgsrvd-waltest3", 4096,
+                                 &ring, scratch, (int32_t)sizeof(scratch));
+                if (!result_ok(r)) {
+                    DBG_LOG("wal log: torn-tail open failed");
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                r = wal_log_append(&wt, &wal_err, &meta,
+                                   (const uint8_t *)"one", 3, TRUE, &seq);
+                if (result_ok(r))
+                    r = wal_log_append(&wt, &wal_err, &meta,
+                                       (const uint8_t *)"two", 3, TRUE, &seq);
+                if (!result_ok(r) || seq != 1) {
+                    DBG_LOG("wal log: torn-tail seed append failed");
+                    wal_log_close(&wt);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                tail_off = wt.active_off;
+                wal_log_close(&wt);
+
+                /* Scribble a partial/garbage record right after the tail */
+                build_seg_path("/tmp/msgsrvd-waltest3", 0, tpath);
+                r = os_open(&wal_err, tpath, O_RDWR, 0, &tfd);
+                if (!result_ok(r)) {
+                    DBG_LOG("wal log: torn-tail reopen-raw failed");
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                mem_set(garbage, 0xFF, (int32_t)sizeof(garbage));
+                gsqe = uring_get_sqe(&ring);
+                uring_prep_write(gsqe, tfd, garbage, (uint32_t)sizeof(garbage),
+                                 (uint64_t)tail_off, 0);
+                r = uring_wait_cqe(&ring, &wal_err, 1, &gcqe);
+                os_close(&wal_err, tfd);
+                if (!result_ok(r) || gcqe.res != (int32_t)sizeof(garbage)) {
+                    DBG_LOG("wal log: torn-tail corrupt write failed");
+                    uring_destroy(&ring);
+                    return 1;
+                }
+
+                /* Recovery must stop at the tail and drop the garbage */
+                r = wal_log_open(&wt, &wal_err, "/tmp/msgsrvd-waltest3", 4096,
+                                 &ring, scratch, (int32_t)sizeof(scratch));
+                if (!result_ok(r) || wt.next_seq != 2 ||
+                    wt.active_off != tail_off) {
+                    DBG_LOG("wal log: torn-tail not dropped "
+                            "(next=%llu off=%d, want off=%d)",
+                            (unsigned long long)wt.next_seq,
+                            wt.active_off, tail_off);
+                    wal_log_close(&wt);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                r = wal_log_append(&wt, &wal_err, &meta,
+                                   (const uint8_t *)"three", 5, TRUE, &seq);
+                if (!result_ok(r) || seq != 2) {
+                    DBG_LOG("wal log: post-torn-tail append failed");
+                    wal_log_close(&wt);
+                    uring_destroy(&ring);
+                    return 1;
+                }
+                wal_log_close(&wt);
+                DBG_LOG("wal log: torn-tail recovery: ok");
+            }
+
             /* Segment rollover: a tiny segment forces a new file */
             {
                 wal_log_t   w2;
 
+                rm_seg("/tmp/msgsrvd-waltest2", 0);
+                rm_seg("/tmp/msgsrvd-waltest2", 1);
                 r = wal_log_open(&w2, &wal_err, "/tmp/msgsrvd-waltest2", 64, &ring,
                                  scratch, (int32_t)sizeof(scratch));
                 if (!result_ok(r)) {

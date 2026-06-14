@@ -18,8 +18,10 @@
  * request, an fdatasync) and waits for the completion before returning.
  * Group commit and async submission come with the event loop.
  *
- * Recovery (scanning existing segments on open, truncating a torn tail)
- * is not implemented here; wal_log_open assumes a fresh log starting at
+ * On open the log recovers: it finds the highest existing segment,
+ * replays its records validating each crc, stops at the first torn or
+ * zero record, truncates that tail, and resumes the append offset and
+ * next sequence from there. An empty directory starts a fresh log at
  * sequence 0.
  */
 
@@ -43,8 +45,8 @@ typedef struct {
  * Open a WAL log under dir, creating the directory if needed. seg_size
  * is the per-segment capacity and must hold at least one record. ring is
  * borrowed for the lifetime of the log. scratch is a staging buffer the
- * encode step writes into; it must be at least as large as the largest
- * record to be appended. Starts a fresh log at sequence 0.
+ * encode step and the recovery scan write into; it must be at least as
+ * large as the largest record. Recovers existing segments if present.
  */
 result_t wal_log_open(wal_log_t *w, err_t *e, const char *dir,
                       int32_t seg_size, uring_t *ring,
