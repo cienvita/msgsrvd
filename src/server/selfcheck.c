@@ -11,6 +11,7 @@
 #include "wal/wal.h"
 #include "sys/os.h"
 #include "io/uring.h"
+#include "server/loop.h"
 #include "server/selfcheck.h"
 
 /* Shared scratch for the connection checks */
@@ -1289,6 +1290,548 @@ out:
     return 1;
 }
 
+/* ---- Event loop, driven over a real loopback socket ---- */
+
+/*
+ * Connect to the loop's listener. The kernel completes the handshake
+ * from the listen backlog, so this returns before the server has
+ * accepted anything and the test can stay in one thread.
+ */
+static int32_t loop_client_connect(int32_t port)
+{
+    err_t         e;
+    sockaddr_in_t addr;
+    int32_t       fd = -1;
+
+    err_init(&e);
+    if (!result_ok(os_socket(&e, AF_INET, SOCK_STREAM, 0, &fd)))
+        return -1;
+
+    mem_zero((uint8_t *)&addr, (int32_t)sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr = htonl(0x7F000001);
+
+    if (!result_ok(os_connect(&e, fd, &addr))) {
+        os_close(&e, fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Turn the loop over until it stops making progress. */
+static void loop_settle(loop_t *l, err_t *e)
+{
+    int32_t i;
+
+    for (i = 0; i < 16; i++)
+        loop_tick(l, e, FALSE);
+}
+
+/*
+ * Read one whole frame. The loop is not running while this blocks, so
+ * everything expected must already have been sent.
+ */
+static bool_t loop_read_frame(int32_t fd, uint8_t *buf, int32_t cap,
+                              msg_header_t *h, int32_t *payload_len)
+{
+    int32_t got = 0;
+    int32_t total;
+
+    while (got < MSG_HEADER_SIZE) {
+        ssize_t n = os_read_raw(fd, buf + got, (size_t)(cap - got));
+        if (n <= 0)
+            return FALSE;
+        got += (int32_t)n;
+    }
+    if (!msg_decode_header(buf, got, h))
+        return FALSE;
+
+    total = MSG_HEADER_SIZE + (int32_t)h->payload_len;
+    if (total > cap)
+        return FALSE;
+    while (got < total) {
+        ssize_t n = os_read_raw(fd, buf + got, (size_t)(cap - got));
+        if (n <= 0)
+            return FALSE;
+        got += (int32_t)n;
+    }
+
+    *payload_len = (int32_t)h->payload_len;
+    return TRUE;
+}
+
+/* Send one framed request. */
+static bool_t loop_send_frame(int32_t fd, uint16_t op, uint16_t flags,
+                              uint64_t key, uint64_t seq,
+                              const uint8_t *payload, int32_t payload_len)
+{
+    static uint8_t out[512];
+    msg_header_t   h;
+
+    if (MSG_HEADER_SIZE + payload_len > (int32_t)sizeof(out))
+        return FALSE;
+
+    h = msg_header_new(op, MSG_RECORD_NONE, flags, (uint32_t)payload_len,
+                       key, seq);
+    msg_encode_header(out, (int32_t)sizeof(out), &h);
+    if (payload_len > 0)
+        mem_copy(out + MSG_HEADER_SIZE, payload, payload_len);
+
+    return os_write_raw(fd, out, (size_t)(MSG_HEADER_SIZE + payload_len)) ==
+           (ssize_t)(MSG_HEADER_SIZE + payload_len);
+}
+
+/*
+ * Several WRITE frames in a single write, so they reach the server in
+ * one read and are processed in one pass. Sent separately they would
+ * arrive whenever the kernel felt like it, and which ones shared a
+ * flush would be a matter of timing rather than of the policy under
+ * test.
+ */
+static bool_t loop_send_write_batch(int32_t fd, uint64_t first_seq,
+                                    int32_t count)
+{
+    static uint8_t out[2048];
+    int32_t        at = 0;
+    int32_t        i;
+
+    for (i = 0; i < count; i++) {
+        msg_header_t h = msg_header_new(MSG_OP_WRITE, MSG_RECORD_NONE,
+                                        MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC,
+                                        1, 1, first_seq + (uint64_t)i);
+
+        if (at + MSG_HEADER_SIZE + 1 > (int32_t)sizeof(out))
+            return FALSE;
+        msg_encode_header(out + at, (int32_t)sizeof(out) - at, &h);
+        out[at + MSG_HEADER_SIZE] = (uint8_t)'x';
+        at += MSG_HEADER_SIZE + 1;
+    }
+
+    return os_write_raw(fd, out, (size_t)at) == (ssize_t)at;
+}
+
+/* HELLO, returning the session the server assigned. */
+static bool_t loop_hello(int32_t fd, loop_t *l, err_t *e, uint64_t resume,
+                         uint64_t *session_out, uint64_t *high_water)
+{
+    static uint8_t buf[256];
+    msg_hello_t    hello;
+    msg_header_t   h;
+    msg_ack_t      ack;
+    int32_t        plen = 0;
+
+    hello.session = resume;
+    hello.name_len = 0;
+    hello._pad0 = 0;
+    hello._pad1 = 0;
+    msg_encode_hello(buf, (int32_t)sizeof(buf), &hello);
+
+    if (!loop_send_frame(fd, MSG_OP_HELLO, MSG_FLAG_ACK_REQ, 0, 0, buf,
+                         MSG_HELLO_SIZE))
+        return FALSE;
+
+    loop_settle(l, e);
+
+    if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen))
+        return FALSE;
+    if (h.op != MSG_OP_ACK || plen != MSG_ACK_SIZE)
+        return FALSE;
+    if (!msg_decode_ack(buf + MSG_HEADER_SIZE, plen, &ack))
+        return FALSE;
+
+    *session_out = h.sequence;
+    *high_water = ack.client_seq;
+    return TRUE;
+}
+
+int selfcheck_loop(void)
+{
+    static uint8_t scratch[4096];
+    static uint8_t buf[512];
+    static char    dir[64];
+    err_t          e;
+    wal_t          w;
+    wal_open_t     info;
+    loop_t         l;
+    int32_t        fd = -1;
+    int32_t        fd2 = -1;
+    msg_header_t   h;
+    int32_t        plen = 0;
+    uint64_t       session = 0;
+    uint64_t       high = 0;
+    int32_t        rc = 1;
+
+    err_init(&e);
+    seg_tmp_path(dir, 7);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("loop: mkdir failed");
+        return 1;
+    }
+    if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info))) {
+        DBG_LOG("loop: wal open failed");
+        tmp_dir_destroy(dir);
+        return 1;
+    }
+
+    if (!result_ok(loop_init(&l, &e, &w, 0, 64))) {
+        DBG_LOG("loop: init failed (io_uring unavailable?), skipping");
+        dbg_err_print(&e);
+        wal_close(&w, &e);
+        tmp_dir_destroy(dir);
+        return 0;
+    }
+    if (l.port <= 0) {
+        DBG_LOG("loop: no port assigned");
+        goto out;
+    }
+
+    /* Accept */
+    fd = loop_client_connect(l.port);
+    if (fd < 0) {
+        DBG_LOG("loop: connect failed");
+        goto out;
+    }
+    loop_settle(&l, &e);
+    if (l.accepted != 1 || loop_live_conns(&l) != 1) {
+        DBG_LOG("loop: connection not accepted (accepted=%d live=%d)",
+                (int32_t)l.accepted, loop_live_conns(&l));
+        goto out;
+    }
+
+    /* A frame before HELLO is refused and the connection closed */
+    {
+        int32_t probe = loop_client_connect(l.port);
+
+        if (probe < 0) {
+            DBG_LOG("loop: probe connect failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_send_frame(probe, MSG_OP_WRITE, MSG_FLAG_ACK_REQ, 0, 1,
+                             NULL, 0)) {
+            DBG_LOG("loop: probe send failed");
+            os_close(&e, probe);
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(probe, buf, (int32_t)sizeof(buf), &h, &plen)) {
+            DBG_LOG("loop: probe got no reply");
+            os_close(&e, probe);
+            goto out;
+        }
+        {
+            msg_err_payload_t ep;
+            if (h.op != MSG_OP_ERR ||
+                !msg_decode_err(buf + MSG_HEADER_SIZE, plen, &ep) ||
+                ep.code != MSG_ERR_NO_SESSION) {
+                DBG_LOG("loop: write before hello was not refused");
+                os_close(&e, probe);
+                goto out;
+            }
+        }
+        os_close(&e, probe);
+        loop_settle(&l, &e);
+    }
+
+    /* HELLO opens a session */
+    if (!loop_hello(fd, &l, &e, 0, &session, &high) || session == 0 ||
+        high != 0) {
+        DBG_LOG("loop: hello failed (session=%d)", (int32_t)session);
+        goto out;
+    }
+
+    /* PING is answered without touching the log */
+    {
+        uint64_t before = l.flushes;
+
+        if (!loop_send_frame(fd, MSG_OP_PING, 0, 0, 42, NULL, 0)) {
+            DBG_LOG("loop: ping send failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_PONG || h.sequence != 42) {
+            DBG_LOG("loop: ping not answered");
+            goto out;
+        }
+        if (l.flushes != before) {
+            DBG_LOG("loop: ping caused a flush");
+            goto out;
+        }
+    }
+
+    /* A durable write is acknowledged only after the flush */
+    {
+        const uint8_t body[] = "hello wal";
+        msg_ack_t     ack;
+
+        if (!loop_send_frame(fd, MSG_OP_WRITE,
+                             MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC, 0xF00D, 1,
+                             body, (int32_t)sizeof(body) - 1)) {
+            DBG_LOG("loop: write send failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ACK || plen != MSG_ACK_SIZE ||
+            !msg_decode_ack(buf + MSG_HEADER_SIZE, plen, &ack)) {
+            DBG_LOG("loop: write not acknowledged");
+            goto out;
+        }
+        if (ack.client_seq != 1 || h.sequence != 1) {
+            DBG_LOG("loop: ack carried seq %d / wal %d",
+                    (int32_t)ack.client_seq, (int32_t)h.sequence);
+            goto out;
+        }
+        if (!(h.flags & MSG_FLAG_SYNC)) {
+            DBG_LOG("loop: ack did not report the durability given");
+            goto out;
+        }
+        /* The acknowledgement is only true if the flush already ran */
+        if (wal_durable_seq(&w) < 1 || l.flushes == 0) {
+            DBG_LOG("loop: acked before the log was flushed");
+            goto out;
+        }
+        if (l.writes != 1) {
+            DBG_LOG("loop: write count wrong");
+            goto out;
+        }
+    }
+
+    /* Several writes in one send share a flush and one cumulative ACK */
+    {
+        uint64_t  flushes_before = l.flushes;
+        msg_ack_t ack;
+        int32_t   i;
+
+        (void)i;
+        if (!loop_send_write_batch(fd, 2, 4)) {
+            DBG_LOG("loop: batched write failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ACK ||
+            !msg_decode_ack(buf + MSG_HEADER_SIZE, plen, &ack)) {
+            DBG_LOG("loop: batch not acknowledged");
+            goto out;
+        }
+        if (ack.client_seq != 5) {
+            DBG_LOG("loop: cumulative ack reported %d, not 5",
+                    (int32_t)ack.client_seq);
+            goto out;
+        }
+        if (l.flushes != flushes_before + 1) {
+            DBG_LOG("loop: batch of four took %d flushes",
+                    (int32_t)(l.flushes - flushes_before));
+            goto out;
+        }
+        if (l.writes != 5 || wal_durable_seq(&w) != 5) {
+            DBG_LOG("loop: batch left the log at %d",
+                    (int32_t)wal_durable_seq(&w));
+            goto out;
+        }
+    }
+
+    /* A resend of something already durable is answered, not stored twice */
+    {
+        uint64_t  writes_before = l.writes;
+        msg_ack_t ack;
+
+        if (!loop_send_frame(fd, MSG_OP_WRITE,
+                             MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC, 1, 3,
+                             (const uint8_t *)"x", 1)) {
+            DBG_LOG("loop: resend failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ACK ||
+            !msg_decode_ack(buf + MSG_HEADER_SIZE, plen, &ack)) {
+            DBG_LOG("loop: resend not acknowledged");
+            goto out;
+        }
+        if (l.writes != writes_before) {
+            DBG_LOG("loop: resend was appended again");
+            goto out;
+        }
+        if (l.dedup_hits != 1 || ack.client_seq != 5) {
+            DBG_LOG("loop: resend ack reported %d", (int32_t)ack.client_seq);
+            goto out;
+        }
+    }
+
+    /* Replication asked for with nothing to replicate to is refused */
+    {
+        msg_err_payload_t ep;
+
+        if (!loop_send_frame(fd, MSG_OP_WRITE,
+                             MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC |
+                             MSG_FLAG_REPLICATED, 1, 6,
+                             (const uint8_t *)"x", 1)) {
+            DBG_LOG("loop: replicated write send failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ERR ||
+            !msg_decode_err(buf + MSG_HEADER_SIZE, plen, &ep) ||
+            ep.code != MSG_ERR_NO_REPLICAS) {
+            DBG_LOG("loop: replicated write was not refused");
+            goto out;
+        }
+
+        /* Unless the client says it will take the write without one */
+        if (!loop_send_frame(fd, MSG_OP_WRITE,
+                             MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC |
+                             MSG_FLAG_REPLICATED | MSG_FLAG_ALLOW_DEGRADED,
+                             1, 6, (const uint8_t *)"x", 1)) {
+            DBG_LOG("loop: degraded write send failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ACK || !(h.flags & MSG_FLAG_DEGRADED)) {
+            DBG_LOG("loop: degraded write not marked degraded");
+            goto out;
+        }
+    }
+
+    /* A verb that exists but is not built says so */
+    {
+        msg_err_payload_t ep;
+        msg_read_t        rd;
+
+        rd.min_seq = 0;
+        msg_encode_read(buf, (int32_t)sizeof(buf), &rd);
+        if (!loop_send_frame(fd, MSG_OP_READ, 0, 1, 0, buf, MSG_READ_SIZE)) {
+            DBG_LOG("loop: read send failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ERR ||
+            !msg_decode_err(buf + MSG_HEADER_SIZE, plen, &ep) ||
+            ep.code != MSG_ERR_UNSUPPORTED) {
+            DBG_LOG("loop: unimplemented verb not reported");
+            goto out;
+        }
+    }
+
+    /* A second connection resuming the session picks up its high-water mark */
+    fd2 = loop_client_connect(l.port);
+    if (fd2 < 0) {
+        DBG_LOG("loop: second connect failed");
+        goto out;
+    }
+    loop_settle(&l, &e);
+    {
+        uint64_t s2 = 0;
+        uint64_t hw = 0;
+
+        if (!loop_hello(fd2, &l, &e, session, &s2, &hw)) {
+            DBG_LOG("loop: resume hello failed");
+            goto out;
+        }
+        if (s2 != session || hw != 6) {
+            DBG_LOG("loop: resume reported session %d high-water %d",
+                    (int32_t)s2, (int32_t)hw);
+            goto out;
+        }
+    }
+
+    /* A session the server never issued is refused, not invented */
+    {
+        int32_t           fd3 = loop_client_connect(l.port);
+        msg_err_payload_t ep;
+        msg_hello_t       hello;
+
+        if (fd3 < 0) {
+            DBG_LOG("loop: third connect failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+
+        hello.session = 999999;
+        hello.name_len = 0;
+        hello._pad0 = 0;
+        hello._pad1 = 0;
+        msg_encode_hello(buf, (int32_t)sizeof(buf), &hello);
+        loop_send_frame(fd3, MSG_OP_HELLO, MSG_FLAG_ACK_REQ, 0, 0, buf,
+                        MSG_HELLO_SIZE);
+        loop_settle(&l, &e);
+
+        if (!loop_read_frame(fd3, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ERR ||
+            !msg_decode_err(buf + MSG_HEADER_SIZE, plen, &ep) ||
+            ep.code != MSG_ERR_SESSION_UNKNOWN) {
+            DBG_LOG("loop: unknown session was not refused");
+            os_close(&e, fd3);
+            goto out;
+        }
+        os_close(&e, fd3);
+        loop_settle(&l, &e);
+    }
+
+    /* Closing a connection frees its slot */
+    {
+        int32_t live_before = loop_live_conns(&l);
+
+        os_close(&e, fd2);
+        fd2 = -1;
+        loop_settle(&l, &e);
+        if (loop_live_conns(&l) != live_before - 1) {
+            DBG_LOG("loop: slot not released on close (live=%d was %d)",
+                    loop_live_conns(&l), live_before);
+            goto out;
+        }
+    }
+
+    /* Everything acknowledged is still there after a reopen */
+    {
+        wal_t      w2;
+        wal_open_t info2;
+
+        os_close(&e, fd);
+        fd = -1;
+        loop_settle(&l, &e);
+        loop_shutdown(&l);
+        wal_close(&w, &e);
+
+        if (!result_ok(wal_open(&w2, &e, dir, 65536, scratch,
+                                (int32_t)sizeof(scratch), &info2))) {
+            DBG_LOG("loop: reopen of the log failed");
+            goto out_nolp;
+        }
+        if (info2.last_seq != 6 || info2.records != 6 || info2.torn) {
+            DBG_LOG("loop: log reopened with %d records, last %d",
+                    (int32_t)info2.records, (int32_t)info2.last_seq);
+            wal_close(&w2, &e);
+            goto out_nolp;
+        }
+        wal_close(&w2, &e);
+    }
+
+    tmp_dir_destroy(dir);
+    DBG_LOG("loop: accept, session, group commit and dedup: ok");
+    return 0;
+
+out:
+    if (fd >= 0)
+        os_close(&e, fd);
+    if (fd2 >= 0)
+        os_close(&e, fd2);
+    loop_shutdown(&l);
+    wal_close(&w, &e);
+out_nolp:
+    tmp_dir_destroy(dir);
+    return rc;
+}
+
 /*
  * Framing checks. These run in CONN_MODE_INTERNAL so that the session
  * handshake stays out of the way; session ordering has its own check.
@@ -1852,8 +2395,10 @@ static int32_t  uring_seen;
 static uint64_t uring_data_sum;
 static int32_t  uring_bad_res;
 
-static void uring_count_cb(uint64_t user_data, int32_t res, uint32_t flags)
+static void uring_count_cb(void *ctx, uint64_t user_data, int32_t res,
+                           uint32_t flags)
 {
+    (void)ctx;
     (void)flags;
     uring_seen++;
     uring_data_sum += user_data;
@@ -1922,7 +2467,7 @@ int selfcheck_uring(void)
         uring_destroy(&ring);
         return 1;
     }
-    if (uring_reap(&ring, uring_count_cb) != 2 || uring_seen != 2 ||
+    if (uring_reap(&ring, uring_count_cb, NULL) != 2 || uring_seen != 2 ||
         uring_data_sum != 3 || uring_bad_res != 0) {
         DBG_LOG("uring: reaped %d completions, sum %d", uring_seen,
                 (int32_t)uring_data_sum);
@@ -1935,7 +2480,7 @@ int selfcheck_uring(void)
      * slots it consumed, the same completions would be delivered again
      * and every one of them handled twice.
      */
-    if (uring_reap(&ring, uring_count_cb) != 0 || uring_seen != 2) {
+    if (uring_reap(&ring, uring_count_cb, NULL) != 0 || uring_seen != 2) {
         DBG_LOG("uring: completions delivered twice");
         uring_destroy(&ring);
         return 1;
@@ -2002,6 +2547,8 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_conn_session())
         return 1;
     if (selfcheck_uring())
+        return 1;
+    if (selfcheck_loop())
         return 1;
     if (selfcheck_err(e))
         return 1;

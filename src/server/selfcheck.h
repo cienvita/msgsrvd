@@ -25,6 +25,7 @@ int selfcheck_payloads(void);
 int selfcheck_wal_record(void);
 int selfcheck_wal_segment(void);
 int selfcheck_wal(void);
+int selfcheck_loop(void);
 int selfcheck_conn_framing(void);
 int selfcheck_conn_session(void);
 int selfcheck_uring(void);

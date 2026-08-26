@@ -97,7 +97,9 @@ enum {
     MSG_ERR_NOT_LEADER      = 5,    /* write reached a follower; text = leader */
     MSG_ERR_BEHIND          = 6,    /* min_seq not reached within the bound */
     MSG_ERR_NO_SESSION      = 7,    /* frame before HELLO, or a second HELLO */
-    MSG_ERR_SESSION_UNKNOWN = 8     /* resume of an expired or unknown session */
+    MSG_ERR_SESSION_UNKNOWN = 8,    /* resume of an expired or unknown session */
+    MSG_ERR_UNSUPPORTED     = 9,    /* verb understood but not implemented yet */
+    MSG_ERR_NO_REPLICAS     = 10    /* replication asked for, none available */
 };
 
 /*

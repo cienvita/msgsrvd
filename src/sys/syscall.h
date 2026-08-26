@@ -21,7 +21,9 @@
 #define SYS_pwrite64        18
 #define SYS_getpid          39
 #define SYS_socket          41
+#define SYS_connect         42
 #define SYS_accept          43
+#define SYS_getsockname     51
 #define SYS_bind            49
 #define SYS_listen          50
 #define SYS_setsockopt      54

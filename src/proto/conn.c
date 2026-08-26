@@ -30,6 +30,31 @@ int32_t conn_recv_append(conn_t *c, const uint8_t *src, int32_t n)
     return take;
 }
 
+int32_t conn_recv_space(const conn_t *c)
+{
+    return c->buf_cap - c->buf_len;
+}
+
+uint8_t *conn_recv_ptr(conn_t *c)
+{
+    return c->buf + c->buf_len;
+}
+
+int32_t conn_recv_commit(conn_t *c, int32_t n)
+{
+    int32_t space;
+
+    if (c->closed || n <= 0)
+        return 0;
+
+    space = c->buf_cap - c->buf_len;
+    if (n > space)
+        n = space;
+
+    c->buf_len += n;
+    return n;
+}
+
 /*
  * Emit a protocol error + close pair. Returns the number of actions
  * written (0, 1, or 2 depending on remaining out capacity). Sets

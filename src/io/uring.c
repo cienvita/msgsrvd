@@ -195,7 +195,7 @@ result_t uring_submit_and_wait(uring_t *ring, err_t *e,
     return RESULT_OK;
 }
 
-int32_t uring_reap(uring_t *ring, uring_cb_t cb)
+int32_t uring_reap(uring_t *ring, uring_cb_t cb, void *ctx)
 {
     uint32_t head = *ring->cq_head;
     uint32_t tail;
@@ -207,7 +207,7 @@ int32_t uring_reap(uring_t *ring, uring_cb_t cb)
 
     while (head != tail) {
         io_uring_cqe_t *cqe = &ring->cqes[head & mask];
-        cb(cqe->user_data, cqe->res, cqe->flags);
+        cb(ctx, cqe->user_data, cqe->res, cqe->flags);
         head++;
         count++;
     }

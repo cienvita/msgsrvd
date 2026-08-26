@@ -97,6 +97,25 @@ void conn_init(conn_t *c, uint8_t *buf, int32_t buf_cap, uint8_t mode);
 int32_t conn_recv_append(conn_t *c, const uint8_t *src, int32_t n);
 
 /*
+ * Free space at the end of the receive buffer, and where it starts.
+ *
+ * These exist for a caller that hands the buffer to the kernel instead
+ * of copying into it: io_uring is told to read into conn_recv_ptr for
+ * conn_recv_space bytes, and conn_recv_commit accounts for what
+ * arrived. conn_recv_append is the copying counterpart, for bytes the
+ * caller already holds.
+ */
+int32_t conn_recv_space(const conn_t *c);
+uint8_t *conn_recv_ptr(conn_t *c);
+
+/*
+ * Account for n bytes written directly into the receive buffer.
+ * Returns the number accepted, which is less than n only if the caller
+ * has overrun the space it was given.
+ */
+int32_t conn_recv_commit(conn_t *c, int32_t n);
+
+/*
  * Drive the state machine. Parses as many complete frames as possible
  * from the receive buffer, emitting actions into out[0..out_cap).
  * Returns the number of actions written.

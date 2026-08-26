@@ -50,10 +50,13 @@ typedef struct {
 
 /*
  * Completion callback.
+ * ctx is passed through from uring_reap, so a caller with state does
+ * not have to reach it through file scope.
  * user_data is whatever was set on the SQE.
  * res is the syscall result (bytes transferred, fd, or negative errno).
  */
-typedef void (*uring_cb_t)(uint64_t user_data, int32_t res, uint32_t flags);
+typedef void (*uring_cb_t)(void *ctx, uint64_t user_data, int32_t res,
+                           uint32_t flags);
 
 /* Initialize the ring. entries must be power of 2. */
 result_t uring_init(uring_t *ring, err_t *e, uint32_t entries);
@@ -78,7 +81,7 @@ result_t uring_submit_and_wait(uring_t *ring, err_t *e,
                                uint32_t min_complete, uint32_t *submitted);
 
 /* Process all available CQEs, calling cb for each. Returns count processed. */
-int32_t uring_reap(uring_t *ring, uring_cb_t cb);
+int32_t uring_reap(uring_t *ring, uring_cb_t cb, void *ctx);
 
 /* ---- SQE prep helpers ---- */
 

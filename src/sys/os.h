@@ -285,6 +285,32 @@ static inline result_t os_bind(err_t *e, int32_t fd,
     return RESULT_OK;
 }
 
+static inline result_t os_connect(err_t *e, int32_t fd,
+                                  const sockaddr_in_t *addr)
+{
+    long r = sys_call3(SYS_connect, (long)fd, (long)addr,
+                       (long)sizeof(sockaddr_in_t));
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
+/* Read back the address a socket is bound to, for a port the kernel chose. */
+static inline result_t os_getsockname(err_t *e, int32_t fd,
+                                      sockaddr_in_t *addr)
+{
+    int32_t len = (int32_t)sizeof(sockaddr_in_t);
+    long    r = sys_call3(SYS_getsockname, (long)fd, (long)addr, (long)&len);
+
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
 static inline result_t os_listen(err_t *e, int32_t fd, int32_t backlog)
 {
     long r = sys_call2(SYS_listen, (long)fd, (long)backlog);
@@ -306,6 +332,13 @@ static inline result_t os_setsockopt(err_t *e, int32_t fd, int32_t level,
         return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
     }
     return RESULT_OK;
+}
+
+/* ---- Plain socket read/write, for callers not driving a ring ---- */
+
+static inline ssize_t os_read_raw(int32_t fd, void *buf, size_t count)
+{
+    return (ssize_t)sys_call3(SYS_read, (long)fd, (long)buf, (long)count);
 }
 
 /* ---- Write (for debug output) ---- */
