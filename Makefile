@@ -8,6 +8,11 @@ SRCDIR  := src
 MSGSRVD_SRCS := $(shell find $(SRCDIR) -name '*.c' \
                   -not -name 'tiny.c' -not -name 'tinye.c')
 
+# Every target compiles the whole source set in one command, so there are
+# no object files to carry dependencies. Headers are listed as explicit
+# prerequisites instead; without them a header-only edit does not rebuild.
+HDRS := $(shell find $(SRCDIR) -name '*.h')
+
 # Size-optimised, no libc, no CRT, no startup files.
 # Drops unused sections, build-id, unwind tables, comment notes.
 TINY_CFLAGS := -std=c99 -Wall -Wextra -Wpedantic -Werror \
@@ -24,13 +29,13 @@ msgsrvd: $(BUILD)/msgsrvd
 tiny:    $(BUILD)/tiny
 tinye:   $(BUILD)/tinye
 
-$(BUILD)/msgsrvd: $(MSGSRVD_SRCS) | $(BUILD)
+$(BUILD)/msgsrvd: $(MSGSRVD_SRCS) $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(MSGSRVD_SRCS)
 
 debug: CFLAGS += -O0 -g -DMSGSRVD_DEBUG
 debug: $(BUILD)/msgsrvd
 
-$(BUILD)/tiny $(BUILD)/tinye: $(BUILD)/%: src/server/%.c | $(BUILD)
+$(BUILD)/tiny $(BUILD)/tinye: $(BUILD)/%: src/server/%.c $(HDRS) | $(BUILD)
 	$(CC) $(TINY_CFLAGS) $(TINY_LDFLAGS) -Isrc -o $@ $<
 	$(STRIP) --strip-all -R .comment -R .note.gnu.property $@
 
