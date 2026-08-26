@@ -28,6 +28,14 @@ typedef struct {
     uint32_t       *cq_entries_ptr;
     io_uring_cqe_t *cqes;
 
+    /*
+     * Userspace tail, ahead of the shared sq_tail by however many SQEs
+     * have been filled but not yet published. The kernel must not see
+     * an SQE until it is fully written, so the shared tail moves only
+     * in uring_submit, and this counter is what tracks the difference.
+     */
+    uint32_t        sqe_tail;
+
     /* Ring fd and sizes */
     int32_t         ring_fd;
     uint32_t        sq_ring_sz;
@@ -53,7 +61,13 @@ result_t uring_init(uring_t *ring, err_t *e, uint32_t entries);
 /* Destroy the ring, unmapping all memory. */
 void uring_destroy(uring_t *ring);
 
-/* Get the next available SQE. Returns NULL if the SQ is full. */
+/*
+ * Claim the next SQE. Returns NULL when the ring is full, which means
+ * the caller must submit and reap before asking again.
+ *
+ * The returned SQE is zeroed and reserved: a second call returns a
+ * different one, whether or not a submit has happened in between.
+ */
 io_uring_sqe_t *uring_get_sqe(uring_t *ring);
 
 /* Submit all pending SQEs to the kernel. Returns number submitted. */
@@ -67,6 +81,21 @@ result_t uring_submit_and_wait(uring_t *ring, err_t *e,
 int32_t uring_reap(uring_t *ring, uring_cb_t cb);
 
 /* ---- SQE prep helpers ---- */
+
+/* No-op. Completes immediately; used to prove the ring round-trips. */
+static inline void uring_prep_nop(io_uring_sqe_t *sqe, uint64_t user_data)
+{
+    sqe->opcode = IORING_OP_NOP;
+    sqe->flags = 0;
+    sqe->ioprio = 0;
+    sqe->fd = -1;
+    sqe->off = 0;
+    sqe->addr = 0;
+    sqe->len = 0;
+    sqe->op_flags = 0;
+    sqe->user_data = user_data;
+    sqe->buf_index = 0;
+}
 
 static inline void uring_prep_accept(io_uring_sqe_t *sqe, int32_t fd,
                                      void *addr, void *addrlen,

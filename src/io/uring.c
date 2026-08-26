@@ -121,20 +121,26 @@ void uring_destroy(uring_t *ring)
 
 io_uring_sqe_t *uring_get_sqe(uring_t *ring)
 {
-    uint32_t head = *ring->sq_head;
-    uint32_t tail = *ring->sq_tail;
-    uint32_t mask = *ring->sq_mask;
-    uint32_t idx;
+    uint32_t        head;
+    uint32_t        mask = *ring->sq_mask;
+    uint32_t        idx;
     io_uring_sqe_t *sqe;
 
     io_barrier();
+    head = *ring->sq_head;
 
-    if (tail - head >= *ring->sq_entries_ptr)
+    /*
+     * Everything from the kernel's head to our own tail is either in
+     * flight or filled and waiting to be published, so that span is
+     * what the ring's capacity has to cover.
+     */
+    if (ring->sqe_tail - head >= *ring->sq_entries_ptr)
         return NULL;
 
-    idx = tail & mask;
+    idx = ring->sqe_tail & mask;
     sqe = &ring->sqes[idx];
     ring->sq_array[idx] = idx;
+    ring->sqe_tail++;
 
     mem_zero((uint8_t *)sqe, (int32_t)sizeof(*sqe));
     return sqe;
@@ -142,15 +148,16 @@ io_uring_sqe_t *uring_get_sqe(uring_t *ring)
 
 result_t uring_submit(uring_t *ring, err_t *e, uint32_t *submitted)
 {
-    uint32_t tail = *ring->sq_tail;
-    uint32_t head = *ring->sq_head;
-    uint32_t to_submit = tail - head;
-    long r;
+    uint32_t to_submit = ring->sqe_tail - *ring->sq_tail;
+    long     r;
 
+    /*
+     * Publish the SQEs only after they are written. On x86-64 stores
+     * are not reordered with stores, so keeping the compiler from
+     * moving the tail update is the whole of the requirement.
+     */
     io_barrier();
-
-    /* Advance the tail so the kernel sees our SQEs */
-    *ring->sq_tail = tail;
+    *ring->sq_tail = ring->sqe_tail;
     io_barrier();
 
     r = sys_call4(SYS_io_uring_enter, (long)ring->ring_fd,
@@ -168,13 +175,11 @@ result_t uring_submit(uring_t *ring, err_t *e, uint32_t *submitted)
 result_t uring_submit_and_wait(uring_t *ring, err_t *e,
                                uint32_t min_complete, uint32_t *submitted)
 {
-    uint32_t tail = *ring->sq_tail;
-    uint32_t head = *ring->sq_head;
-    uint32_t to_submit = tail - head;
-    long r;
+    uint32_t to_submit = ring->sqe_tail - *ring->sq_tail;
+    long     r;
 
     io_barrier();
-    *ring->sq_tail = tail;
+    *ring->sq_tail = ring->sqe_tail;
     io_barrier();
 
     r = sys_call4(SYS_io_uring_enter, (long)ring->ring_fd,
