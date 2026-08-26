@@ -12,6 +12,12 @@
  * Higher layers handle dispatch; this layer owns only protocol
  * correctness (framing, magic, version, bounds).
  *
+ * Sessions are enforced but not assigned here: a client-mode
+ * connection must carry HELLO as its first frame and must not carry a
+ * second one, which is an ordering rule this layer can check without
+ * knowing what a session is. The id itself comes from the WAL layer
+ * above, which sees the HELLO frame like any other.
+ *
  * Contract:
  *   1. Caller reads bytes from the socket into conn->buf using
  *      conn_recv_append, then calls conn_feed to drain complete
@@ -23,6 +29,16 @@
  *      the caller should stop feeding bytes and tear the connection
  *      down. Any remaining unparsed bytes are discarded.
  */
+
+/*
+ * Connection mode. Client connections carry the session handshake;
+ * node-to-node connections (replication) do not, since they are not
+ * sessions and their peer is not a client.
+ */
+enum {
+    CONN_MODE_CLIENT    = 0,    /* HELLO required as the first frame */
+    CONN_MODE_INTERNAL  = 1     /* no session handshake */
+};
 
 /* Action emitted by conn_feed */
 enum {
@@ -61,14 +77,17 @@ typedef struct {
     int32_t         buf_cap;
     int32_t         buf_len;
     bool_t          closed;     /* set on fatal protocol error */
-    uint8_t         _pad[3];
+    uint8_t         mode;       /* CONN_MODE_* */
+    bool_t          hello_seen; /* a HELLO frame has been emitted */
+    uint8_t         _pad;
 } conn_t;
 
 /*
  * Initialize a connection with a caller-provided receive buffer.
  * buf typically comes from a per-connection arena.
+ * mode is CONN_MODE_CLIENT or CONN_MODE_INTERNAL.
  */
-void conn_init(conn_t *c, uint8_t *buf, int32_t buf_cap);
+void conn_init(conn_t *c, uint8_t *buf, int32_t buf_cap, uint8_t mode);
 
 /*
  * Append received bytes to the connection's receive buffer.

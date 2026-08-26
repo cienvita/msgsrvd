@@ -1,15 +1,15 @@
 #include "proto/conn.h"
 #include "core/mem.h"
 
-void conn_init(conn_t *c, uint8_t *buf, int32_t buf_cap)
+void conn_init(conn_t *c, uint8_t *buf, int32_t buf_cap, uint8_t mode)
 {
     c->buf = buf;
     c->buf_cap = buf_cap;
     c->buf_len = 0;
     c->closed = FALSE;
-    c->_pad[0] = 0;
-    c->_pad[1] = 0;
-    c->_pad[2] = 0;
+    c->mode = mode;
+    c->hello_seen = FALSE;
+    c->_pad = 0;
 }
 
 int32_t conn_recv_append(conn_t *c, const uint8_t *src, int32_t n)
@@ -91,14 +91,14 @@ int32_t conn_feed(conn_t *c, conn_action_t *out, int32_t out_cap)
             break;
         }
 
-        if (hdr.version == 0 || hdr.version > MSG_VERSION) {
+        if (hdr.version < MSG_VERSION_MIN || hdr.version > MSG_VERSION) {
             n_actions += emit_fatal(c, out + n_actions, out_cap - n_actions,
                                     MSG_ERR_BAD_VERSION, hdr.sequence);
             cursor = c->buf_len;
             break;
         }
 
-        if (hdr.op < MSG_OP_WRITE || hdr.op > MSG_OP_PONG) {
+        if (hdr.op < MSG_OP_MIN || hdr.op > MSG_OP_MAX) {
             n_actions += emit_fatal(c, out + n_actions, out_cap - n_actions,
                                     MSG_ERR_BAD_OP, hdr.sequence);
             cursor = c->buf_len;
@@ -106,15 +106,36 @@ int32_t conn_feed(conn_t *c, conn_action_t *out, int32_t out_cap)
         }
 
         /*
-         * Payload must fit in the receive buffer. This is stricter
-         * than msg_header_valid's 64MB ceiling, receive buffer is
-         * sized per connection and large frames use a separate path.
+         * Payload must be within the protocol cap and must fit in this
+         * connection's receive buffer, which is usually the smaller of
+         * the two. Both produce the same code: the client's remedy is
+         * the same either way, send less.
          */
-        if (hdr.payload_len > (uint32_t)(c->buf_cap - MSG_HEADER_SIZE)) {
+        if (hdr.payload_len > (uint32_t)MSG_MAX_PAYLOAD ||
+            hdr.payload_len > (uint32_t)(c->buf_cap - MSG_HEADER_SIZE)) {
             n_actions += emit_fatal(c, out + n_actions, out_cap - n_actions,
                                     MSG_ERR_PAYLOAD_TOO_BIG, hdr.sequence);
             cursor = c->buf_len;
             break;
+        }
+
+        /*
+         * Session ordering: exactly one HELLO, and before anything
+         * else. Two ways to violate it, a repeated HELLO and a frame
+         * that arrives without one. Checked before the frame is
+         * complete, since no further bytes can make either legal.
+         */
+        if (c->mode == CONN_MODE_CLIENT) {
+            bool_t is_hello = (hdr.op == MSG_OP_HELLO) ? TRUE : FALSE;
+
+            if ((is_hello && c->hello_seen) ||
+                (!is_hello && !c->hello_seen)) {
+                n_actions += emit_fatal(c, out + n_actions,
+                                        out_cap - n_actions,
+                                        MSG_ERR_NO_SESSION, hdr.sequence);
+                cursor = c->buf_len;
+                break;
+            }
         }
 
         total = MSG_HEADER_SIZE + (int32_t)hdr.payload_len;
@@ -129,6 +150,14 @@ int32_t conn_feed(conn_t *c, conn_action_t *out, int32_t out_cap)
         out[n_actions].u.frame.payload_len = (int32_t)hdr.payload_len;
         n_actions++;
         cursor += total;
+
+        /*
+         * Only a frame that was actually emitted opens the session. A
+         * HELLO whose payload has not fully arrived breaks out above
+         * and is re-examined on the next call.
+         */
+        if (hdr.op == MSG_OP_HELLO)
+            c->hello_seen = TRUE;
     }
 
     /*
