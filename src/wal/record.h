@@ -43,6 +43,13 @@
 /* A record's payload is a protocol payload, so the two limits agree. */
 #define WAL_MAX_PAYLOAD     MSG_MAX_PAYLOAD
 
+/*
+ * Largest a record can be on disk. A recovery scan needs a buffer at
+ * least this big to be sure it can hold any single record it meets.
+ */
+#define WAL_REC_MAX_SIZE \
+    (WAL_REC_HEADER_SIZE + ((WAL_MAX_PAYLOAD + 7) & ~7))
+
 typedef struct {
     uint32_t    crc;            /* over everything after this field */
     uint32_t    len;            /* payload bytes, before padding */

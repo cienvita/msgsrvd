@@ -7,6 +7,8 @@
 #include "proto/conn.h"
 #include "core/crc32c.h"
 #include "wal/record.h"
+#include "wal/segment.h"
+#include "sys/os.h"
 #include "io/uring.h"
 #include "server/selfcheck.h"
 
@@ -309,6 +311,516 @@ int selfcheck_payloads(void)
 
     DBG_LOG("payload codecs: ok");
     return 0;
+}
+
+/* ---- WAL segment checks, the first that touch real files ---- */
+
+/*
+ * A directory of our own under /tmp, named with the pid so two runs
+ * cannot collide. Removed at the end of the check.
+ */
+static void seg_tmp_path(char *out)
+{
+    const char prefix[] = "/tmp/msgsrvd-selfcheck-";
+    int32_t    plen = (int32_t)sizeof(prefix) - 1;
+    uint32_t   pid = (uint32_t)os_getpid();
+    char       digits[12];
+    int32_t    nd = 0;
+    int32_t    i;
+
+    for (i = 0; i < plen; i++)
+        out[i] = prefix[i];
+
+    if (pid == 0)
+        digits[nd++] = '0';
+    while (pid > 0) {
+        digits[nd++] = (char)('0' + (int32_t)(pid % 10));
+        pid /= 10;
+    }
+    while (nd > 0)
+        out[i++] = digits[--nd];
+    out[i] = '\0';
+}
+
+/* Fill in a record with everything except the sequence, which the
+ * segment assigns. */
+static void seg_fill_rec(wal_rec_t *r, uint32_t len, uint64_t session,
+                         uint64_t client_seq, uint64_t key)
+{
+    r->crc = 0;
+    r->len = len;
+    r->term = 1;
+    r->seq = 0;
+    r->session = session;
+    r->client_seq = client_seq;
+    r->record_type = MSG_RECORD_NONE;
+    r->flags = MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC;
+    r->_pad = 0;
+    r->partition_key = key;
+}
+
+int selfcheck_wal_segment(void)
+{
+    static uint8_t  scratch[4096];
+    static uint8_t  payload[64];
+    static char     dir_path[64];
+    static char     name[WAL_SEG_NAME_MAX];
+    err_t           e;
+    int32_t         dir_fd = -1;
+    result_t        r;
+    int32_t         rc = 1;
+    /* Every base sequence used below, so cleanup can find the files */
+    static const uint64_t used[] = {1, 1000, 2000, 3000, 4000, 5000};
+    int32_t         i;
+
+    err_init(&e);
+    mem_set(payload, 0x5A, (int32_t)sizeof(payload));
+    seg_tmp_path(dir_path);
+
+    r = os_mkdir(&e, dir_path, MODE_0700);
+    if (!result_ok(r)) {
+        DBG_LOG("wal segment: mkdir failed");
+        dbg_err_print(&e);
+        return 1;
+    }
+
+    r = os_openat(&e, AT_FDCWD, dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                  0, &dir_fd);
+    if (!result_ok(r)) {
+        DBG_LOG("wal segment: cannot open the directory");
+        dbg_err_print(&e);
+        os_rmdir(&e, dir_path);
+        return 1;
+    }
+
+    /* Name format: fixed-width decimal so a listing sorts into order */
+    wal_seg_name(1, name);
+    if (name[WAL_SEG_DIGITS - 1] != '1' || name[0] != '0' ||
+        name[WAL_SEG_DIGITS] != '.' || name[WAL_SEG_NAME_MAX - 1] != '\0') {
+        DBG_LOG("wal segment: name format wrong");
+        goto out;
+    }
+    /* Multi-digit, so a reversed or misaligned conversion shows up */
+    wal_seg_name(4021, name);
+    if (name[WAL_SEG_DIGITS - 4] != '4' || name[WAL_SEG_DIGITS - 3] != '0' ||
+        name[WAL_SEG_DIGITS - 2] != '2' || name[WAL_SEG_DIGITS - 1] != '1' ||
+        name[WAL_SEG_DIGITS - 5] != '0') {
+        DBG_LOG("wal segment: multi-digit name wrong");
+        goto out;
+    }
+
+    /* Create, append, sync, and what each step makes durable */
+    {
+        wal_seg_t s;
+        wal_rec_t rec;
+        int64_t   expect_off = 0;
+
+        r = wal_seg_create(&s, &e, dir_fd, 1, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: create failed");
+            dbg_err_print(&e);
+            goto out;
+        }
+        if (s.next_seq != 1 || s.durable_seq != 0 || s.write_off != 0) {
+            DBG_LOG("wal segment: fresh state wrong");
+            goto out;
+        }
+
+        /*
+         * The segment is preallocated and zero-filled to its full
+         * capacity. The scan's whole notion of where the written
+         * region ends rests on reading zeros past it, so check that
+         * the far end of a fresh segment is readable and zero rather
+         * than simply absent.
+         */
+        {
+            int32_t n = 0;
+            if (!result_ok(os_pread(&e, s.fd, scratch, WAL_REC_HEADER_SIZE,
+                                    4096 - WAL_REC_HEADER_SIZE, &n)) ||
+                n != WAL_REC_HEADER_SIZE) {
+                DBG_LOG("wal segment: not preallocated (read %d)", n);
+                goto out;
+            }
+            for (i = 0; i < WAL_REC_HEADER_SIZE; i++) {
+                if (scratch[i] != 0) {
+                    DBG_LOG("wal segment: preallocated space not zero");
+                    goto out;
+                }
+            }
+        }
+
+        /* Creating the same segment twice must not silently reuse it */
+        {
+            wal_seg_t dup;
+            err_t     de;
+            err_init(&de);
+            if (result_ok(wal_seg_create(&dup, &de, dir_fd, 1, 4096))) {
+                DBG_LOG("wal segment: create clobbered an existing segment");
+                goto out;
+            }
+        }
+
+        for (i = 0; i < 3; i++) {
+            seg_fill_rec(&rec, 24, 7, (uint64_t)(i + 1), 0xF00D);
+            r = wal_seg_append(&s, &e, &rec, payload, scratch,
+                               (int32_t)sizeof(scratch));
+            if (!result_ok(r)) {
+                DBG_LOG("wal segment: append %d failed", i);
+                dbg_err_print(&e);
+                goto out;
+            }
+            if (rec.seq != (uint64_t)(i + 1)) {
+                DBG_LOG("wal segment: append assigned seq %d", (int32_t)rec.seq);
+                goto out;
+            }
+            expect_off += wal_rec_size(24);
+        }
+
+        if (s.write_off != expect_off || s.next_seq != 4) {
+            DBG_LOG("wal segment: append offsets wrong");
+            goto out;
+        }
+        /* Appended is not durable */
+        if (s.durable_seq != 0) {
+            DBG_LOG("wal segment: append advanced durable_seq");
+            goto out;
+        }
+
+        r = wal_seg_sync(&s, &e);
+        if (!result_ok(r) || s.durable_seq != 3 ||
+            s.synced_off != s.write_off) {
+            DBG_LOG("wal segment: sync did not advance durability");
+            goto out;
+        }
+        /* A sync with nothing outstanding is a no-op, not an error */
+        if (!result_ok(wal_seg_sync(&s, &e)) || s.durable_seq != 3) {
+            DBG_LOG("wal segment: idle sync misbehaved");
+            goto out;
+        }
+
+        wal_seg_close(&s, &e);
+
+        /* Reopen and recover what was made durable */
+        r = wal_seg_open(&s, &e, dir_fd, 1, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: reopen failed");
+            goto out;
+        }
+        {
+            wal_seg_scan_t scan;
+            r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch),
+                                &scan);
+            if (!result_ok(r) || scan.records != 3 || scan.last_seq != 3 ||
+                scan.torn || scan.end_off != expect_off ||
+                s.next_seq != 4 || s.durable_seq != 3) {
+                DBG_LOG("wal segment: recovery of a clean segment wrong");
+                goto out;
+            }
+        }
+        wal_seg_close(&s, &e);
+        DBG_LOG("wal segment: create/append/sync/recover: ok");
+    }
+
+    /* A torn tail is dropped, and the space is reusable afterwards */
+    {
+        wal_seg_t      s;
+        wal_seg_scan_t scan;
+        wal_rec_t      rec;
+        int64_t        third_off;
+        int32_t        rec_size = wal_rec_size(24);
+
+        r = wal_seg_create(&s, &e, dir_fd, 1000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: torn-case create failed");
+            goto out;
+        }
+        for (i = 0; i < 3; i++) {
+            seg_fill_rec(&rec, 24, 1, (uint64_t)(i + 1), 1);
+            if (!result_ok(wal_seg_append(&s, &e, &rec, payload, scratch,
+                                          (int32_t)sizeof(scratch)))) {
+                DBG_LOG("wal segment: torn-case append failed");
+                goto out;
+            }
+        }
+        wal_seg_sync(&s, &e);
+        third_off = (int64_t)(2 * rec_size);
+        wal_seg_close(&s, &e);
+
+        /* Corrupt one payload byte of the third record */
+        r = wal_seg_open(&s, &e, dir_fd, 1000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: torn-case reopen failed");
+            goto out;
+        }
+        {
+            uint8_t bad = 0x00;
+            if (!result_ok(os_pwrite_full(&e, s.fd, &bad, 1,
+                                          third_off + WAL_REC_HEADER_SIZE))) {
+                DBG_LOG("wal segment: could not corrupt the record");
+                goto out;
+            }
+        }
+        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        if (!result_ok(r) || scan.records != 2 || scan.last_seq != 1001 ||
+            !scan.torn || scan.end_off != third_off ||
+            s.next_seq != 1002 || s.write_off != third_off) {
+            DBG_LOG("wal segment: torn tail not dropped (records=%d torn=%d)",
+                    (int32_t)scan.records, (int32_t)scan.torn);
+            goto out;
+        }
+
+        /* The dropped space is reused by the next append */
+        seg_fill_rec(&rec, 24, 1, 3, 1);
+        if (!result_ok(wal_seg_append(&s, &e, &rec, payload, scratch,
+                                      (int32_t)sizeof(scratch))) ||
+            rec.seq != 1002) {
+            DBG_LOG("wal segment: append after a torn tail failed");
+            goto out;
+        }
+        wal_seg_sync(&s, &e);
+        wal_seg_close(&s, &e);
+
+        r = wal_seg_open(&s, &e, dir_fd, 1000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: post-torn reopen failed");
+            goto out;
+        }
+        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        if (!result_ok(r) || scan.records != 3 || scan.last_seq != 1002 ||
+            scan.torn) {
+            DBG_LOG("wal segment: rewritten tail not recovered");
+            goto out;
+        }
+        wal_seg_close(&s, &e);
+        DBG_LOG("wal segment: torn tail dropped and reused: ok");
+    }
+
+    /*
+     * A record that is intact but out of sequence. Its checksum is
+     * correct, because it was written correctly, just not now. Only the
+     * sequence test separates it from a current record.
+     */
+    {
+        wal_seg_t      s;
+        wal_seg_scan_t scan;
+        wal_rec_t      rec;
+        int32_t        total;
+        int32_t        rec_size = wal_rec_size(24);
+
+        r = wal_seg_create(&s, &e, dir_fd, 2000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: stale-case create failed");
+            goto out;
+        }
+        for (i = 0; i < 2; i++) {
+            seg_fill_rec(&rec, 24, 1, (uint64_t)(i + 1), 1);
+            wal_seg_append(&s, &e, &rec, payload, scratch,
+                           (int32_t)sizeof(scratch));
+        }
+        wal_seg_sync(&s, &e);
+
+        /* A well-formed record carrying a sequence from another life */
+        seg_fill_rec(&rec, 24, 1, 3, 1);
+        rec.seq = 99;
+        total = wal_rec_encode(scratch, (int32_t)sizeof(scratch), &rec,
+                               payload);
+        if (total == 0 ||
+            !result_ok(os_pwrite_full(&e, s.fd, scratch, total,
+                                      (int64_t)(2 * rec_size)))) {
+            DBG_LOG("wal segment: could not plant the stale record");
+            goto out;
+        }
+        wal_seg_sync(&s, &e);
+        wal_seg_close(&s, &e);
+
+        r = wal_seg_open(&s, &e, dir_fd, 2000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: stale-case reopen failed");
+            goto out;
+        }
+        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        if (!result_ok(r) || scan.records != 2 || !scan.torn ||
+            scan.end_off != (int64_t)(2 * rec_size)) {
+            DBG_LOG("wal segment: stale record accepted (records=%d)",
+                    (int32_t)scan.records);
+            goto out;
+        }
+        wal_seg_close(&s, &e);
+        DBG_LOG("wal segment: out-of-sequence record rejected: ok");
+    }
+
+    /*
+     * A record header whose length claims more of the segment than is
+     * left. The length is checked against the segment bound before the
+     * checksum, because the alternative is trying to read a record
+     * that cannot be there and failing the whole recovery over it
+     * rather than reporting a torn tail and carrying on.
+     */
+    {
+        wal_seg_t      s;
+        wal_seg_scan_t scan;
+        wal_rec_t      rec;
+        int32_t        rec_size = wal_rec_size(24);
+        int64_t        cap = 4096;
+        int64_t        plant_off;
+
+        r = wal_seg_create(&s, &e, dir_fd, 5000, cap);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: overrun-case create failed");
+            goto out;
+        }
+        for (i = 0; i < 2; i++) {
+            seg_fill_rec(&rec, 24, 1, (uint64_t)(i + 1), 1);
+            wal_seg_append(&s, &e, &rec, payload, scratch,
+                           (int32_t)sizeof(scratch));
+        }
+        wal_seg_sync(&s, &e);
+        plant_off = (int64_t)(2 * rec_size);
+
+        /* Header only, with a length no segment this size could hold */
+        seg_fill_rec(&rec, (uint32_t)cap, 1, 3, 1);
+        rec.seq = 5002;
+        mem_copy(scratch, (const uint8_t *)&rec, WAL_REC_HEADER_SIZE);
+        if (!result_ok(os_pwrite_full(&e, s.fd, scratch,
+                                      WAL_REC_HEADER_SIZE, plant_off))) {
+            DBG_LOG("wal segment: could not plant the overrunning header");
+            goto out;
+        }
+        wal_seg_sync(&s, &e);
+        wal_seg_close(&s, &e);
+
+        r = wal_seg_open(&s, &e, dir_fd, 5000, cap);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: overrun-case reopen failed");
+            goto out;
+        }
+        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: overrunning length failed the recovery");
+            goto out;
+        }
+        if (scan.records != 2 || !scan.torn || scan.end_off != plant_off) {
+            DBG_LOG("wal segment: overrunning length mishandled (records=%d)",
+                    (int32_t)scan.records);
+            goto out;
+        }
+        wal_seg_close(&s, &e);
+        DBG_LOG("wal segment: over-long record rejected: ok");
+    }
+
+    /* A full segment refuses the append rather than overrunning */
+    {
+        wal_seg_t s;
+        wal_rec_t rec;
+        int32_t   rec_size = wal_rec_size(24);
+        int64_t   cap = (int64_t)(rec_size * 3);
+        int32_t   appended = 0;
+
+        r = wal_seg_create(&s, &e, dir_fd, 3000, cap);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: full-case create failed");
+            goto out;
+        }
+        for (i = 0; i < 5; i++) {
+            bool_t fits = wal_seg_fits(&s, 24);
+            err_t  ae;
+            err_init(&ae);
+            seg_fill_rec(&rec, 24, 1, (uint64_t)(i + 1), 1);
+            if (result_ok(wal_seg_append(&s, &ae, &rec, payload, scratch,
+                                         (int32_t)sizeof(scratch)))) {
+                if (!fits) {
+                    DBG_LOG("wal segment: fits said no but append said yes");
+                    goto out;
+                }
+                appended++;
+            } else {
+                if (fits) {
+                    DBG_LOG("wal segment: fits said yes but append said no");
+                    goto out;
+                }
+            }
+        }
+        if (appended != 3 || s.write_off != cap) {
+            DBG_LOG("wal segment: full segment took %d records", appended);
+            goto out;
+        }
+        wal_seg_close(&s, &e);
+        DBG_LOG("wal segment: full segment refuses appends: ok");
+    }
+
+    /*
+     * A scan whose buffer holds more than one record but not the one
+     * that straddles its end, so the refill path runs. Sized from the
+     * record so the arithmetic survives a change to the header.
+     */
+    {
+        wal_seg_t      s;
+        wal_seg_scan_t scan;
+        wal_rec_t      rec;
+        int32_t        rec_size = wal_rec_size(24);
+        int32_t        block = 2 * rec_size + WAL_REC_HEADER_SIZE + 4;
+
+        r = wal_seg_create(&s, &e, dir_fd, 4000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: block-case create failed");
+            goto out;
+        }
+        for (i = 0; i < 9; i++) {
+            seg_fill_rec(&rec, 24, 1, (uint64_t)(i + 1), 1);
+            wal_seg_append(&s, &e, &rec, payload, scratch,
+                           (int32_t)sizeof(scratch));
+        }
+        wal_seg_sync(&s, &e);
+        wal_seg_close(&s, &e);
+
+        r = wal_seg_open(&s, &e, dir_fd, 4000, 4096);
+        if (!result_ok(r)) {
+            DBG_LOG("wal segment: block-case reopen failed");
+            goto out;
+        }
+        r = wal_seg_recover(&s, &e, scratch, block, &scan);
+        if (!result_ok(r) || scan.records != 9 || scan.last_seq != 4008 ||
+            scan.torn) {
+            DBG_LOG("wal segment: multi-block scan found %d records",
+                    (int32_t)scan.records);
+            goto out;
+        }
+
+        /* A buffer too small for a record fails rather than skipping it */
+        {
+            err_t          se;
+            wal_seg_scan_t sscan;
+            err_init(&se);
+            if (result_ok(wal_seg_recover(&s, &se, scratch,
+                                          WAL_REC_HEADER_SIZE, &sscan))) {
+                DBG_LOG("wal segment: undersized scan buffer accepted");
+                goto out;
+            }
+        }
+        wal_seg_close(&s, &e);
+        DBG_LOG("wal segment: multi-block scan: ok");
+    }
+
+    rc = 0;
+
+out:
+    for (i = 0; i < (int32_t)(sizeof(used) / sizeof(used[0])); i++) {
+        err_t ce;
+        err_init(&ce);
+        wal_seg_name(used[i], name);
+        os_unlinkat(&ce, dir_fd, name, 0);
+    }
+    if (dir_fd >= 0)
+        os_close(&e, dir_fd);
+    {
+        err_t de;
+        err_init(&de);
+        os_rmdir(&de, dir_path);
+    }
+
+    if (rc == 0)
+        DBG_LOG("wal segment: ok");
+    return rc;
 }
 
 /*
@@ -925,6 +1437,8 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_payloads())
         return 1;
     if (selfcheck_wal_record())
+        return 1;
+    if (selfcheck_wal_segment())
         return 1;
     if (selfcheck_conn_framing())
         return 1;
