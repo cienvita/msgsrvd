@@ -19,8 +19,10 @@
  */
 
 int selfcheck_arena(arena_t *a);
+int selfcheck_crc32c(void);
 int selfcheck_header(void);
 int selfcheck_payloads(void);
+int selfcheck_wal_record(void);
 int selfcheck_conn_framing(void);
 int selfcheck_conn_session(void);
 int selfcheck_uring(void);

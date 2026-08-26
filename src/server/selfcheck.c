@@ -5,6 +5,8 @@
 #include "core/debug.h"
 #include "proto/msg.h"
 #include "proto/conn.h"
+#include "core/crc32c.h"
+#include "wal/record.h"
 #include "io/uring.h"
 #include "server/selfcheck.h"
 
@@ -313,6 +315,315 @@ int selfcheck_payloads(void)
  * Framing checks. These run in CONN_MODE_INTERNAL so that the session
  * handshake stays out of the way; session ordering has its own check.
  */
+/*
+ * CRC32C against the published vectors, then the property the record
+ * codec depends on: feeding two chunks equals feeding their
+ * concatenation.
+ */
+int selfcheck_crc32c(void)
+{
+    const uint8_t check[] = "123456789";
+    uint32_t      whole;
+    uint32_t      split;
+
+    if (!crc32c_available()) {
+        DBG_LOG("crc32c: SSE4.2 missing on this CPU");
+        return 1;
+    }
+
+    whole = crc32c(0, check, 9);
+    if (whole != 0xE3069283u) {
+        DBG_LOG("crc32c: check vector wrong (got %08X)", whole);
+        return 1;
+    }
+    if (crc32c(0, (const uint8_t *)"a", 1) != 0xC1D04330u) {
+        DBG_LOG("crc32c: single-byte vector wrong");
+        return 1;
+    }
+    if (crc32c(0, check, 0) != 0) {
+        DBG_LOG("crc32c: empty input changed the running value");
+        return 1;
+    }
+
+    /* Split at 4, which crosses the 8-byte step boundary in both parts */
+    split = crc32c(crc32c(0, check, 4), check + 4, 5);
+    if (split != whole) {
+        DBG_LOG("crc32c: chaining disagrees with one pass");
+        return 1;
+    }
+
+    /* Every split point has to agree, not just one */
+    {
+        int32_t i;
+        for (i = 0; i <= 9; i++) {
+            if (crc32c(crc32c(0, check, i), check + i, 9 - i) != whole) {
+                DBG_LOG("crc32c: chaining wrong at split %d", i);
+                return 1;
+            }
+        }
+    }
+
+    DBG_LOG("crc32c: ok");
+    return 0;
+}
+
+int selfcheck_wal_record(void)
+{
+    static uint8_t buf[256];
+    const char     body[] = "record payload";
+    int32_t        body_len = (int32_t)sizeof(body) - 1;
+
+    /* Sizes, including the padding to an 8-byte boundary */
+    if (wal_rec_size(0) != WAL_REC_HEADER_SIZE ||
+        wal_rec_size(1) != WAL_REC_HEADER_SIZE + 8 ||
+        wal_rec_size(8) != WAL_REC_HEADER_SIZE + 8 ||
+        wal_rec_size(9) != WAL_REC_HEADER_SIZE + 16) {
+        DBG_LOG("wal record: size/padding wrong");
+        return 1;
+    }
+    if (wal_rec_size(-1) != 0 || wal_rec_size(WAL_MAX_PAYLOAD + 1) != 0) {
+        DBG_LOG("wal record: out-of-range size accepted");
+        return 1;
+    }
+
+    /* Round trip, verify, and the padding actually zeroed */
+    {
+        wal_rec_t out;
+        wal_rec_t in;
+        int32_t   total;
+        int32_t   i;
+
+        mem_set(buf, 0xFF, (int32_t)sizeof(buf));
+
+        out.crc = 0xDEADBEEF;   /* ignored on input */
+        out.len = (uint32_t)body_len;
+        out.term = 3;
+        out.seq = 12345;
+        out.session = 0xABCD;
+        out.client_seq = 7;
+        out.record_type = MSG_RECORD_NONE;
+        out.flags = MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC | MSG_FLAG_REPLICATED;
+        out._pad = 0xFFFFFFFF;  /* cleared by the encoder */
+        out.partition_key = 0x1122334455667788ULL;
+
+        total = wal_rec_encode(buf, (int32_t)sizeof(buf), &out,
+                               (const uint8_t *)body);
+        if (total != wal_rec_size(body_len)) {
+            DBG_LOG("wal record: encode returned %d", total);
+            return 1;
+        }
+        if (out.crc == 0xDEADBEEF) {
+            DBG_LOG("wal record: encode did not set the checksum");
+            return 1;
+        }
+
+        for (i = WAL_REC_HEADER_SIZE + body_len; i < total; i++) {
+            if (buf[i] != 0) {
+                DBG_LOG("wal record: padding not zeroed at %d", i);
+                return 1;
+            }
+        }
+
+        if (!wal_rec_decode(buf, total, &in)) {
+            DBG_LOG("wal record: decode failed");
+            return 1;
+        }
+        if (in.crc != out.crc || in.len != out.len || in.term != out.term ||
+            in.seq != out.seq || in.session != out.session ||
+            in.client_seq != out.client_seq ||
+            in.record_type != out.record_type || in.flags != out.flags ||
+            in._pad != 0 ||
+            in.partition_key != out.partition_key) {
+            DBG_LOG("wal record: field mismatch after decode");
+            return 1;
+        }
+        if (mem_cmp(buf + WAL_REC_HEADER_SIZE, (const uint8_t *)body,
+                    body_len) != 0) {
+            DBG_LOG("wal record: payload mismatch");
+            return 1;
+        }
+        if (!wal_rec_verify(buf, total, &in)) {
+            DBG_LOG("wal record: verify rejected a good record");
+            return 1;
+        }
+        if (wal_rec_is_end(&in)) {
+            DBG_LOG("wal record: a real record read as end of segment");
+            return 1;
+        }
+
+        /* A short buffer is a torn tail, not a valid record */
+        if (wal_rec_verify(buf, total - 1, &in)) {
+            DBG_LOG("wal record: verify accepted a truncated record");
+            return 1;
+        }
+
+        /* Corruption anywhere inside the checksummed range is caught */
+        buf[WAL_REC_HEADER_SIZE] ^= 0x01;           /* payload */
+        if (wal_rec_verify(buf, total, &in)) {
+            DBG_LOG("wal record: payload corruption undetected");
+            return 1;
+        }
+        buf[WAL_REC_HEADER_SIZE] ^= 0x01;
+
+        buf[16] ^= 0x01;                            /* seq, in the header */
+        if (wal_rec_verify(buf, total, &in)) {
+            DBG_LOG("wal record: header corruption undetected");
+            return 1;
+        }
+        buf[16] ^= 0x01;
+
+        buf[total - 1] ^= 0x01;                     /* padding */
+        if (wal_rec_verify(buf, total, &in)) {
+            DBG_LOG("wal record: padding corruption undetected");
+            return 1;
+        }
+        buf[total - 1] ^= 0x01;
+
+        /*
+         * A corrupted length is the case the layout is arranged for:
+         * it decides how much to read, so it has to be inside the
+         * checksum rather than trusted before it.
+         */
+        {
+            wal_rec_t lied = in;
+
+            lied.len = in.len + 8;
+            if (wal_rec_verify(buf, total + 8, &lied)) {
+                DBG_LOG("wal record: inflated length undetected");
+                return 1;
+            }
+            lied.len = (uint32_t)WAL_MAX_PAYLOAD + 1;
+            if (wal_rec_verify(buf, (int32_t)sizeof(buf), &lied)) {
+                DBG_LOG("wal record: out-of-range length accepted");
+                return 1;
+            }
+        }
+
+        /*
+         * The case the checksum layout exists for. A length corrupted
+         * within the same padded size leaves the checksummed range
+         * identical, so it is caught only because the length is itself
+         * inside the range. 14 and 9 bytes both pad to 16.
+         */
+        {
+            uint32_t  shrunk = 9;
+            wal_rec_t reread;
+
+            mem_copy(buf + 4, (const uint8_t *)&shrunk, sizeof(shrunk));
+            if (!wal_rec_decode(buf, total, &reread)) {
+                DBG_LOG("wal record: decode failed after length edit");
+                return 1;
+            }
+            if (wal_rec_size((int32_t)reread.len) != total) {
+                DBG_LOG("wal record: length edit changed the padded size");
+                return 1;
+            }
+            if (wal_rec_verify(buf, total, &reread)) {
+                DBG_LOG("wal record: length corruption undetected");
+                return 1;
+            }
+            mem_copy(buf + 4, (const uint8_t *)&in.len, sizeof(in.len));
+        }
+
+        /* No room means no record, rather than a half-written one */
+        if (wal_rec_encode(buf, total - 1, &out,
+                           (const uint8_t *)body) != 0) {
+            DBG_LOG("wal record: encode wrote past the buffer");
+            return 1;
+        }
+    }
+
+    /* Empty payload: header only, still checksummed */
+    {
+        wal_rec_t out;
+        wal_rec_t in;
+        int32_t   total;
+
+        mem_zero(buf, (int32_t)sizeof(buf));
+        out.len = 0;
+        out.term = 1;
+        out.seq = 1;
+        out.session = 0;
+        out.client_seq = 0;
+        out.record_type = MSG_RECORD_NONE;
+        out.flags = 0;
+        out.partition_key = 0;
+
+        total = wal_rec_encode(buf, (int32_t)sizeof(buf), &out, NULL);
+        if (total != WAL_REC_HEADER_SIZE ||
+            !wal_rec_decode(buf, total, &in) ||
+            !wal_rec_verify(buf, total, &in) ||
+            in.seq != 1) {
+            DBG_LOG("wal record: empty payload round trip failed");
+            return 1;
+        }
+        /* Carries no payload, but it is still a record */
+        if (wal_rec_is_end(&in)) {
+            DBG_LOG("wal record: empty record read as end of segment");
+            return 1;
+        }
+    }
+
+    /*
+     * Unwritten space. A preallocated segment reads back as zeros, so
+     * the scan has to see that as the end of the written region rather
+     * than as a record.
+     */
+    {
+        wal_rec_t in;
+
+        mem_zero(buf, (int32_t)sizeof(buf));
+        if (!wal_rec_decode(buf, WAL_REC_HEADER_SIZE, &in) ||
+            !wal_rec_is_end(&in)) {
+            DBG_LOG("wal record: zeroed header not read as end of segment");
+            return 1;
+        }
+    }
+
+    /* Two records back to back decode at their own offsets */
+    {
+        wal_rec_t a;
+        wal_rec_t b;
+        wal_rec_t got;
+        int32_t   na;
+        int32_t   nb;
+
+        mem_zero(buf, (int32_t)sizeof(buf));
+
+        a.len = 3; a.term = 1; a.seq = 1; a.session = 5; a.client_seq = 1;
+        a.record_type = MSG_RECORD_NONE; a.flags = 0; a.partition_key = 1;
+        na = wal_rec_encode(buf, (int32_t)sizeof(buf), &a,
+                            (const uint8_t *)"abc");
+
+        b.len = 5; b.term = 1; b.seq = 2; b.session = 5; b.client_seq = 2;
+        b.record_type = MSG_RECORD_NONE; b.flags = 0; b.partition_key = 2;
+        nb = wal_rec_encode(buf + na, (int32_t)sizeof(buf) - na, &b,
+                            (const uint8_t *)"defgh");
+
+        if (na == 0 || nb == 0) {
+            DBG_LOG("wal record: back-to-back encode failed");
+            return 1;
+        }
+        if (!wal_rec_decode(buf + na, nb, &got) ||
+            !wal_rec_verify(buf + na, nb, &got) ||
+            got.seq != 2 || got.partition_key != 2 ||
+            mem_cmp(buf + na + WAL_REC_HEADER_SIZE,
+                    (const uint8_t *)"defgh", 5) != 0) {
+            DBG_LOG("wal record: second record wrong");
+            return 1;
+        }
+        /* And the region after both is still end-of-segment */
+        if (!wal_rec_decode(buf + na + nb, WAL_REC_HEADER_SIZE, &got) ||
+            !wal_rec_is_end(&got)) {
+            DBG_LOG("wal record: no end marker after the last record");
+            return 1;
+        }
+    }
+
+    DBG_LOG("wal record: ok");
+    return 0;
+}
+
 int selfcheck_conn_framing(void)
 {
     conn_t        c;
@@ -607,9 +918,13 @@ int selfcheck_run(arena_t *a, err_t *e)
 {
     if (selfcheck_arena(a))
         return 1;
+    if (selfcheck_crc32c())
+        return 1;
     if (selfcheck_header())
         return 1;
     if (selfcheck_payloads())
+        return 1;
+    if (selfcheck_wal_record())
         return 1;
     if (selfcheck_conn_framing())
         return 1;
