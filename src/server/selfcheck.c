@@ -8,6 +8,7 @@
 #include "core/crc32c.h"
 #include "wal/record.h"
 #include "wal/segment.h"
+#include "wal/wal.h"
 #include "sys/os.h"
 #include "io/uring.h"
 #include "server/selfcheck.h"
@@ -319,27 +320,137 @@ int selfcheck_payloads(void)
  * A directory of our own under /tmp, named with the pid so two runs
  * cannot collide. Removed at the end of the check.
  */
-static void seg_tmp_path(char *out)
+static int32_t tmp_append_u32(char *out, int32_t at, uint32_t v)
+{
+    char    digits[12];
+    int32_t nd = 0;
+
+    if (v == 0)
+        digits[nd++] = '0';
+    while (v > 0) {
+        digits[nd++] = (char)('0' + (int32_t)(v % 10));
+        v /= 10;
+    }
+    while (nd > 0)
+        out[at++] = digits[--nd];
+    return at;
+}
+
+/*
+ * A directory of our own under /tmp, named with the pid so two runs
+ * cannot collide, and with a tag so scenarios that leave a directory
+ * damaged do not disturb each other.
+ */
+static void seg_tmp_path(char *out, int32_t tag)
 {
     const char prefix[] = "/tmp/msgsrvd-selfcheck-";
     int32_t    plen = (int32_t)sizeof(prefix) - 1;
-    uint32_t   pid = (uint32_t)os_getpid();
-    char       digits[12];
-    int32_t    nd = 0;
     int32_t    i;
 
     for (i = 0; i < plen; i++)
         out[i] = prefix[i];
 
-    if (pid == 0)
-        digits[nd++] = '0';
-    while (pid > 0) {
-        digits[nd++] = (char)('0' + (int32_t)(pid % 10));
-        pid /= 10;
-    }
-    while (nd > 0)
-        out[i++] = digits[--nd];
+    i = tmp_append_u32(out, i, (uint32_t)os_getpid());
+    out[i++] = '-';
+    i = tmp_append_u32(out, i, (uint32_t)tag);
     out[i] = '\0';
+}
+
+/*
+ * Empty the directory and remove it. Enumerates rather than being told
+ * the names, since the rollover cases decide for themselves how many
+ * segments they leave behind.
+ */
+static void tmp_dir_destroy(const char *path)
+{
+    static uint8_t dbuf[4096];
+    err_t          e;
+    int32_t        fd = -1;
+
+    err_init(&e);
+    if (!result_ok(os_openat(&e, AT_FDCWD, path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, &fd)))
+        return;
+
+    for (;;) {
+        int32_t n = 0;
+        int32_t off = 0;
+
+        if (!result_ok(os_getdents64(&e, fd, dbuf, (int32_t)sizeof(dbuf), &n)))
+            break;
+        if (n == 0)
+            break;
+
+        while (off < n) {
+            uint16_t    reclen = 0;
+            const char *nm;
+
+            mem_copy((uint8_t *)&reclen, dbuf + off + DIRENT64_RECLEN_OFF,
+                     (int32_t)sizeof(reclen));
+            if (reclen < DIRENT64_NAME_OFF || off + (int32_t)reclen > n)
+                break;
+
+            nm = (const char *)(dbuf + off + DIRENT64_NAME_OFF);
+            if (!(nm[0] == '.' && (nm[1] == '\0' ||
+                                   (nm[1] == '.' && nm[2] == '\0'))))
+                os_unlinkat(&e, fd, nm, 0);
+
+            off += (int32_t)reclen;
+        }
+    }
+
+    os_close(&e, fd);
+    os_rmdir(&e, path);
+}
+
+/* Create an empty file in a directory, for the cases that need one. */
+static bool_t tmp_touch(const char *dir_path, const char *name)
+{
+    err_t   e;
+    int32_t dir_fd = -1;
+    int32_t fd = -1;
+
+    err_init(&e);
+    if (!result_ok(os_openat(&e, AT_FDCWD, dir_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, &dir_fd)))
+        return FALSE;
+    if (!result_ok(os_openat(&e, dir_fd, name, O_WRONLY | O_CREAT | O_CLOEXEC,
+                             MODE_0600, &fd))) {
+        os_close(&e, dir_fd);
+        return FALSE;
+    }
+    os_close(&e, fd);
+    os_close(&e, dir_fd);
+    return TRUE;
+}
+
+/* Flip a byte inside a named segment, to stage a corruption. */
+static bool_t tmp_corrupt(const char *dir_path, uint64_t base_seq,
+                          int64_t offset)
+{
+    err_t   e;
+    char    name[WAL_SEG_NAME_MAX];
+    int32_t dir_fd = -1;
+    int32_t fd = -1;
+    uint8_t b = 0;
+    int32_t n = 0;
+    bool_t  ok = FALSE;
+
+    err_init(&e);
+    wal_seg_name(base_seq, name);
+
+    if (!result_ok(os_openat(&e, AT_FDCWD, dir_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0, &dir_fd)))
+        return FALSE;
+    if (result_ok(os_openat(&e, dir_fd, name, O_RDWR | O_CLOEXEC, 0, &fd))) {
+        if (result_ok(os_pread(&e, fd, &b, 1, offset, &n)) && n == 1) {
+            b ^= 0x01;
+            ok = result_ok(os_pwrite_full(&e, fd, &b, 1, offset));
+        }
+        os_close(&e, fd);
+    }
+    os_close(&e, dir_fd);
+    return ok;
 }
 
 /* Fill in a record with everything except the sequence, which the
@@ -369,13 +480,11 @@ int selfcheck_wal_segment(void)
     int32_t         dir_fd = -1;
     result_t        r;
     int32_t         rc = 1;
-    /* Every base sequence used below, so cleanup can find the files */
-    static const uint64_t used[] = {1, 1000, 2000, 3000, 4000, 5000};
     int32_t         i;
 
     err_init(&e);
     mem_set(payload, 0x5A, (int32_t)sizeof(payload));
-    seg_tmp_path(dir_path);
+    seg_tmp_path(dir_path, 0);
 
     r = os_mkdir(&e, dir_path, MODE_0700);
     if (!result_ok(r)) {
@@ -804,23 +913,380 @@ int selfcheck_wal_segment(void)
     rc = 0;
 
 out:
-    for (i = 0; i < (int32_t)(sizeof(used) / sizeof(used[0])); i++) {
-        err_t ce;
-        err_init(&ce);
-        wal_seg_name(used[i], name);
-        os_unlinkat(&ce, dir_fd, name, 0);
-    }
     if (dir_fd >= 0)
         os_close(&e, dir_fd);
-    {
-        err_t de;
-        err_init(&de);
-        os_rmdir(&de, dir_path);
-    }
+    tmp_dir_destroy(dir_path);
 
     if (rc == 0)
         DBG_LOG("wal segment: ok");
     return rc;
+}
+
+/* ---- Whole-log checks: rollover, recovery across segments, retention ---- */
+
+/* Append n records of the standard test size, syncing at the end. */
+static result_t wal_put(wal_t *w, err_t *e, uint8_t *scratch,
+                        int32_t scratch_len, const uint8_t *payload,
+                        int32_t n)
+{
+    wal_rec_t rec;
+    int32_t   i;
+    result_t  r;
+
+    for (i = 0; i < n; i++) {
+        seg_fill_rec(&rec, 24, 1, (uint64_t)(i + 1), 1);
+        r = wal_append(w, e, &rec, payload, scratch, scratch_len);
+        if (!result_ok(r))
+            return r;
+    }
+    return wal_sync(w, e);
+}
+
+int selfcheck_wal(void)
+{
+    static uint8_t scratch[4096];
+    static uint8_t payload[64];
+    static char    dir[64];
+    err_t          e;
+    result_t       r;
+    wal_t          w;
+    wal_open_t     info;
+    int32_t        rec_size = wal_rec_size(24);
+    int64_t        cap = (int64_t)(rec_size * 3);   /* three records */
+
+    err_init(&e);
+    mem_set(payload, 0x5A, (int32_t)sizeof(payload));
+
+    /* Empty directory, rollover, reopen, retention */
+    seg_tmp_path(dir, 1);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("wal: mkdir failed");
+        return 1;
+    }
+
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r)) {
+        DBG_LOG("wal: open of an empty directory failed");
+        dbg_err_print(&e);
+        goto out;
+    }
+    if (!info.created || info.segments != 1 || info.first_seq != 1 ||
+        info.last_seq != 0 || info.records != 0 ||
+        wal_next_seq(&w) != 1 || wal_durable_seq(&w) != 0) {
+        DBG_LOG("wal: empty log state wrong");
+        goto out;
+    }
+
+    /* Ten records across a segment that holds three */
+    if (!result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 10))) {
+        DBG_LOG("wal: appends failed");
+        dbg_err_print(&e);
+        goto out;
+    }
+    if (w.seg_count != 4 || w.seg_base[0] != 1 || w.seg_base[1] != 4 ||
+        w.seg_base[2] != 7 || w.seg_base[3] != 10) {
+        DBG_LOG("wal: rollover boundaries wrong (count=%d)", w.seg_count);
+        goto out;
+    }
+    if (wal_next_seq(&w) != 11 || wal_durable_seq(&w) != 10) {
+        DBG_LOG("wal: sequence state wrong after rollover");
+        goto out;
+    }
+
+    /* A record no segment could hold is refused, not rolled over to */
+    {
+        wal_rec_t big;
+        err_t     be;
+        int32_t   before = w.seg_count;
+
+        err_init(&be);
+        seg_fill_rec(&big, (uint32_t)cap, 1, 99, 1);
+        if (result_ok(wal_append(&w, &be, &big, payload, scratch,
+                                 (int32_t)sizeof(scratch)))) {
+            DBG_LOG("wal: oversized record accepted");
+            goto out;
+        }
+        if (w.seg_count != before) {
+            DBG_LOG("wal: oversized record caused a rollover");
+            goto out;
+        }
+    }
+
+    wal_close(&w, &e);
+
+    /* Reopen: every segment scanned, boundaries checked */
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r)) {
+        DBG_LOG("wal: reopen failed");
+        dbg_err_print(&e);
+        goto out;
+    }
+    if (info.created || info.segments != 4 || info.records != 10 ||
+        info.first_seq != 1 || info.last_seq != 10 || info.torn ||
+        wal_next_seq(&w) != 11) {
+        DBG_LOG("wal: multi-segment recovery wrong (recs=%d last=%d)",
+                (int32_t)info.records, (int32_t)info.last_seq);
+        goto out;
+    }
+
+    /* Retention drops only whole segments below the line */
+    {
+        int32_t removed = 0;
+
+        if (!result_ok(wal_retain(&w, &e, 7, &removed)) || removed != 2 ||
+            w.seg_count != 2 || wal_first_seq(&w) != 7) {
+            DBG_LOG("wal: retention removed %d segments", removed);
+            goto out;
+        }
+        /* Nothing more can go: the rest holds sequences at or above 7 */
+        if (!result_ok(wal_retain(&w, &e, 7, &removed)) || removed != 0) {
+            DBG_LOG("wal: retention removed a segment it should keep");
+            goto out;
+        }
+        /* Even a line past the end leaves the active segment alone */
+        if (!result_ok(wal_retain(&w, &e, 1000, &removed)) ||
+            w.seg_count != 1 || wal_first_seq(&w) != 10) {
+            DBG_LOG("wal: retention did not stop at the active segment");
+            goto out;
+        }
+    }
+    wal_close(&w, &e);
+
+    /* What is left still opens, and starts where retention left it */
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r) || info.segments != 1 || info.first_seq != 10 ||
+        info.last_seq != 10 || info.records != 1) {
+        DBG_LOG("wal: reopen after retention wrong");
+        goto out;
+    }
+    wal_close(&w, &e);
+    DBG_LOG("wal: rollover, recovery and retention: ok");
+    tmp_dir_destroy(dir);
+
+    /* A torn tail in the last segment is a crash, and is survivable */
+    seg_tmp_path(dir, 2);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("wal: mkdir 2 failed");
+        return 1;
+    }
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r) ||
+        !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 8))) {
+        DBG_LOG("wal: torn-case setup failed");
+        goto out;
+    }
+    wal_close(&w, &e);
+
+    /* Damage the second record of the last segment (base 7) */
+    if (!tmp_corrupt(dir, 7, (int64_t)rec_size + WAL_REC_HEADER_SIZE)) {
+        DBG_LOG("wal: could not corrupt the active segment");
+        goto out;
+    }
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r)) {
+        DBG_LOG("wal: refused to open after a torn tail");
+        dbg_err_print(&e);
+        goto out;
+    }
+    if (!info.torn || info.last_seq != 7 || info.records != 7 ||
+        wal_next_seq(&w) != 8) {
+        DBG_LOG("wal: torn tail mishandled (last=%d torn=%d)",
+                (int32_t)info.last_seq, (int32_t)info.torn);
+        goto out;
+    }
+    /* And the log carries on from there */
+    if (!result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 1)) ||
+        wal_durable_seq(&w) != 8) {
+        DBG_LOG("wal: cannot append after a torn tail");
+        goto out;
+    }
+    wal_close(&w, &e);
+    DBG_LOG("wal: torn tail in the active segment survived: ok");
+    tmp_dir_destroy(dir);
+
+    /*
+     * Damage anywhere earlier is not a crash artefact. The records
+     * after it were acknowledged, so the log refuses to open rather
+     * than quietly presenting a shorter history than a client was
+     * promised.
+     */
+    seg_tmp_path(dir, 3);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("wal: mkdir 3 failed");
+        return 1;
+    }
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r) ||
+        !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 8))) {
+        DBG_LOG("wal: middle-case setup failed");
+        goto out;
+    }
+    wal_close(&w, &e);
+
+    if (!tmp_corrupt(dir, 4, WAL_REC_HEADER_SIZE)) {
+        DBG_LOG("wal: could not corrupt a middle segment");
+        goto out;
+    }
+    {
+        err_t me;
+        err_init(&me);
+        if (result_ok(wal_open(&w, &me, dir, cap, scratch,
+                               (int32_t)sizeof(scratch), &info))) {
+            DBG_LOG("wal: opened with a damaged middle segment");
+            goto out;
+        }
+    }
+    DBG_LOG("wal: damaged middle segment refuses to open: ok");
+    tmp_dir_destroy(dir);
+
+    /* A missing segment is a hole in the sequence, and is refused too */
+    seg_tmp_path(dir, 4);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("wal: mkdir 4 failed");
+        return 1;
+    }
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r) ||
+        !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 8))) {
+        DBG_LOG("wal: gap-case setup failed");
+        goto out;
+    }
+    wal_close(&w, &e);
+    {
+        err_t   ue;
+        char    name[WAL_SEG_NAME_MAX];
+        int32_t dfd = -1;
+
+        err_init(&ue);
+        wal_seg_name(4, name);
+        if (!result_ok(os_openat(&ue, AT_FDCWD, dir,
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                                 &dfd)) ||
+            !result_ok(os_unlinkat(&ue, dfd, name, 0))) {
+            DBG_LOG("wal: could not remove a middle segment");
+            goto out;
+        }
+        os_close(&ue, dfd);
+    }
+    {
+        err_t ge;
+        err_init(&ge);
+        if (result_ok(wal_open(&w, &ge, dir, cap, scratch,
+                               (int32_t)sizeof(scratch), &info))) {
+            DBG_LOG("wal: opened with a hole in the sequence");
+            goto out;
+        }
+    }
+    DBG_LOG("wal: hole in the sequence refuses to open: ok");
+    tmp_dir_destroy(dir);
+
+    /*
+     * A middle segment torn in its unused tail, where the boundary
+     * with the next segment still lines up. The sequence check cannot
+     * see this one: the records that survive end exactly where the
+     * next segment claims to start, so only noticing the tear itself
+     * catches it. Constructed with a capacity that leaves room after
+     * the last record a segment can hold.
+     */
+    seg_tmp_path(dir, 6);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("wal: mkdir 6 failed");
+        return 1;
+    }
+    {
+        int64_t   roomy = (int64_t)(rec_size * 3 + WAL_REC_HEADER_SIZE + 4);
+        wal_rec_t bogus;
+        err_t     te;
+        int32_t   dfd = -1;
+        int32_t   sfd = -1;
+        char      name[WAL_SEG_NAME_MAX];
+
+        r = wal_open(&w, &e, dir, roomy, scratch, (int32_t)sizeof(scratch),
+                     &info);
+        if (!result_ok(r) ||
+            !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                               payload, 4))) {
+            DBG_LOG("wal: tail-tear setup failed");
+            goto out;
+        }
+        if (w.seg_count != 2 || w.seg_base[1] != 4) {
+            DBG_LOG("wal: tail-tear setup rolled over wrong (count=%d)",
+                    w.seg_count);
+            goto out;
+        }
+        wal_close(&w, &e);
+
+        /* A header in the first segment's unused tail that no flush wrote */
+        seg_fill_rec(&bogus, 0, 1, 1, 1);
+        bogus.seq = 4;
+        bogus.crc = 0xDEADBEEF;
+        mem_copy(scratch, (const uint8_t *)&bogus, WAL_REC_HEADER_SIZE);
+
+        err_init(&te);
+        wal_seg_name(1, name);
+        if (!result_ok(os_openat(&te, AT_FDCWD, dir,
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                                 &dfd)) ||
+            !result_ok(os_openat(&te, dfd, name, O_RDWR | O_CLOEXEC, 0,
+                                 &sfd)) ||
+            !result_ok(os_pwrite_full(&te, sfd, scratch, WAL_REC_HEADER_SIZE,
+                                      (int64_t)(rec_size * 3)))) {
+            DBG_LOG("wal: could not plant the tail tear");
+            goto out;
+        }
+        os_close(&te, sfd);
+        os_close(&te, dfd);
+
+        err_init(&te);
+        if (result_ok(wal_open(&w, &te, dir, roomy, scratch,
+                               (int32_t)sizeof(scratch), &info))) {
+            DBG_LOG("wal: opened with a tear in a middle segment's tail");
+            goto out;
+        }
+    }
+    DBG_LOG("wal: tear in a middle segment's tail refuses to open: ok");
+    tmp_dir_destroy(dir);
+
+    /* Files that are not segments are ignored, not guessed at */
+    seg_tmp_path(dir, 5);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("wal: mkdir 5 failed");
+        return 1;
+    }
+    if (!tmp_touch(dir, "notasegment") ||
+        !tmp_touch(dir, "00000000000000000001.seg.tmp") ||
+        !tmp_touch(dir, "0000000000000000000x.seg") ||
+        !tmp_touch(dir, "00000000000000000000.seg")) {
+        DBG_LOG("wal: could not create the decoy files");
+        goto out;
+    }
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    if (!result_ok(r) || !info.created || info.segments != 1 ||
+        info.first_seq != 1) {
+        DBG_LOG("wal: decoy files disturbed the open (segments=%d)",
+                info.segments);
+        goto out;
+    }
+    wal_close(&w, &e);
+    DBG_LOG("wal: non-segment files ignored: ok");
+    tmp_dir_destroy(dir);
+
+    DBG_LOG("wal: ok");
+    return 0;
+
+    /*
+     * One exit for every failure: dir always names the scenario that
+     * was running, so the cleanup is the same wherever it came from.
+     */
+out:
+    wal_close(&w, &e);
+    tmp_dir_destroy(dir);
+    return 1;
 }
 
 /*
@@ -1439,6 +1905,8 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_wal_record())
         return 1;
     if (selfcheck_wal_segment())
+        return 1;
+    if (selfcheck_wal())
         return 1;
     if (selfcheck_conn_framing())
         return 1;

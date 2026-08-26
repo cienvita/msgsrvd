@@ -157,6 +157,23 @@ static inline result_t os_pwrite_full(err_t *e, int32_t fd,
     return RESULT_OK;
 }
 
+/*
+ * One getdents64 call. Returns the bytes of directory records placed
+ * in buf, or 0 at the end of the directory. The caller walks the
+ * records and calls again until it gets 0.
+ */
+static inline result_t os_getdents64(err_t *e, int32_t fd, uint8_t *buf,
+                                     int32_t count, int32_t *n_out)
+{
+    long r = sys_call3(SYS_getdents64, (long)fd, (long)buf, (long)count);
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *n_out = (int32_t)r;
+    return RESULT_OK;
+}
+
 static inline result_t os_ftruncate(err_t *e, int32_t fd, int64_t length)
 {
     long r = sys_call2(SYS_ftruncate, (long)fd, (long)length);

@@ -65,6 +65,18 @@
 #define EFD_NONBLOCK 0x800
 #define EFD_CLOEXEC  0x80000
 
+/*
+ * getdents64 record. The kernel packs these: the name starts at a
+ * fixed byte offset and each record's length is carried inside it, so
+ * the layout is walked with explicit offsets rather than a struct
+ * whose padding the compiler would choose.
+ */
+#define DIRENT64_RECLEN_OFF 16      /* uint16, bytes in this record */
+#define DIRENT64_TYPE_OFF   18      /* uint8 */
+#define DIRENT64_NAME_OFF   19      /* NUL-terminated, fills the record */
+
+#define DT_REG  8                   /* d_type: regular file */
+
 /* sockaddr_in, IPv4 */
 typedef struct {
     uint16_t    sin_family;
