@@ -14,8 +14,12 @@
 #define SYS_open            2
 #define SYS_close           3
 #define SYS_fstat           5
+#define SYS_lseek           8
 #define SYS_mmap            9
 #define SYS_munmap          11
+#define SYS_pread64         17
+#define SYS_pwrite64        18
+#define SYS_getpid          39
 #define SYS_socket          41
 #define SYS_accept          43
 #define SYS_bind            49
@@ -24,6 +28,14 @@
 #define SYS_exit            60
 #define SYS_fsync           74
 #define SYS_fdatasync       75
+#define SYS_ftruncate       77
+#define SYS_rename          82
+#define SYS_mkdir           83
+#define SYS_rmdir           84
+#define SYS_unlink          87
+#define SYS_getdents64      217
+#define SYS_openat          257
+#define SYS_unlinkat        263
 #define SYS_fallocate       285
 #define SYS_eventfd2        290
 #define SYS_io_uring_setup  425

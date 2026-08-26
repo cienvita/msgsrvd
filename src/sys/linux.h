@@ -13,10 +13,21 @@
 #define O_WRONLY    0x0001
 #define O_RDWR      0x0002
 #define O_CREAT     0x0040
+#define O_EXCL      0x0080
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 #define O_DIRECT    0x4000
 #define O_DSYNC     0x1000
+#define O_DIRECTORY 0x10000
+#define O_CLOEXEC   0x80000
+
+/* openat() special dirfd, and unlinkat() flags */
+#define AT_FDCWD            (-100)
+#define AT_REMOVEDIR        0x200
+
+/* File mode bits for a file only its owner may read or write */
+#define MODE_0600   0600
+#define MODE_0700   0700
 
 /* mmap() */
 #define PROT_READ   0x1
@@ -38,6 +49,9 @@
 #define TCP_NODELAY 1
 
 /* Common errno values */
+#define ENOENT       2
+#define EIO          5
+#define EBADF        9
 #define EAGAIN      11
 #define ENOMEM      12
 #define EEXIST      17
