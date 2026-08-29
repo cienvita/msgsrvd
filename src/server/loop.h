@@ -6,6 +6,7 @@
 #include "proto/conn.h"
 #include "wal/wal.h"
 #include "io/uring.h"
+#include "server/session.h"
 #include "sys/linux.h"
 
 /*
@@ -36,7 +37,6 @@
 #define LOOP_MAX_CONNS    64
 #define LOOP_RECV_CAP     8192
 #define LOOP_SEND_CAP     8192
-#define LOOP_MAX_SESSIONS 256
 
 /* Per-connection slot. */
 typedef struct {
@@ -55,19 +55,6 @@ typedef struct {
     uint8_t     _pad[2];
 } loop_conn_t;
 
-/*
- * A session is a client's identity for deduplication. It lives only in
- * memory: after a restart every session is unknown, which is the
- * documented answer to a resume the server cannot honour, and the
- * client opens a new one. Rebuilding the table from the log so that
- * deduplication survives a restart needs the session records the
- * format reserves and is not done here.
- */
-typedef struct {
-    uint64_t    id;
-    uint64_t    last_client_seq;    /* highest made durable */
-} loop_session_t;
-
 typedef struct {
     uring_t         ring;
     wal_t          *wal;
@@ -79,9 +66,12 @@ typedef struct {
     bool_t          stop;
 
     loop_conn_t     conns[LOOP_MAX_CONNS];
-    loop_session_t  sessions[LOOP_MAX_SESSIONS];
-    int32_t         session_count;
-    uint64_t        next_session;
+
+    /*
+     * Not owned. The caller builds it from the log before the loop
+     * starts, which is what lets deduplication survive a restart.
+     */
+    session_table_t *sessions;
 
     /* Set during a tick when a record was appended and not yet flushed */
     bool_t          wal_dirty;
@@ -106,7 +96,8 @@ void loop_set_signal_fd(loop_t *l, int32_t fd);
  * Bind, listen, and prepare the ring. port 0 asks the kernel to choose
  * one, which it reports back in l->port.
  */
-result_t loop_init(loop_t *l, err_t *e, wal_t *wal, uint16_t port,
+result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
+                   session_table_t *sessions, uint16_t port,
                    uint32_t ring_entries);
 
 /*

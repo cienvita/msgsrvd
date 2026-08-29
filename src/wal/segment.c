@@ -109,7 +109,8 @@ result_t wal_seg_open(wal_seg_t *s, err_t *e, int32_t dir_fd,
 }
 
 result_t wal_seg_recover(wal_seg_t *s, err_t *e, uint8_t *scratch,
-                         int32_t scratch_len, wal_seg_scan_t *out)
+                         int32_t scratch_len, wal_seg_scan_t *out,
+                         wal_rec_cb_t cb, void *ctx)
 {
     int64_t  off = 0;
     uint64_t expected = s->base_seq;
@@ -180,6 +181,9 @@ result_t wal_seg_recover(wal_seg_t *s, err_t *e, uint8_t *scratch,
                 done = TRUE;
                 break;
             }
+
+            if (cb)
+                cb(ctx, &rec);
 
             expected++;
             records++;

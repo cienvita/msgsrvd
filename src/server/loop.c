@@ -68,33 +68,6 @@ static void slot_release(loop_t *l, int32_t i)
     l->closed++;
 }
 
-/* ---- sessions ---- */
-
-static loop_session_t *session_find(loop_t *l, uint64_t id)
-{
-    int32_t i;
-
-    for (i = 0; i < l->session_count; i++) {
-        if (l->sessions[i].id == id)
-            return &l->sessions[i];
-    }
-    return NULL;
-}
-
-static loop_session_t *session_open(loop_t *l)
-{
-    loop_session_t *s;
-
-    if (l->session_count >= LOOP_MAX_SESSIONS)
-        return NULL;
-
-    s = &l->sessions[l->session_count];
-    s->id = l->next_session++;
-    s->last_client_seq = 0;
-    l->session_count++;
-    return s;
-}
-
 /* ---- reply staging ---- */
 
 /* Append a frame to the connection's send buffer. FALSE if it is full. */
@@ -150,9 +123,9 @@ static bool_t reply_ack(loop_conn_t *c, int32_t slot, uint16_t flags,
 static void handle_hello(loop_t *l, int32_t slot, const msg_header_t *h,
                          const uint8_t *payload, int32_t payload_len)
 {
-    loop_conn_t    *c = &l->conns[slot];
-    msg_hello_t     hello;
-    loop_session_t *s;
+    loop_conn_t *c = &l->conns[slot];
+    msg_hello_t  hello;
+    session_t   *s;
 
     if (!msg_decode_hello(payload, payload_len, &hello) ||
         !msg_hello_valid(&hello, payload_len)) {
@@ -162,14 +135,14 @@ static void handle_hello(loop_t *l, int32_t slot, const msg_header_t *h,
     }
 
     if (hello.session == 0) {
-        s = session_open(l);
+        s = session_create(l->sessions);
         if (!s) {
             reply_err(c, slot, MSG_ERR_SESSION_UNKNOWN, h->sequence);
             c->closing = TRUE;
             return;
         }
     } else {
-        s = session_find(l, hello.session);
+        s = session_lookup(l->sessions, hello.session);
         if (!s) {
             /*
              * The client is told its session is gone rather than
@@ -189,8 +162,8 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
                          const uint8_t *payload, int32_t payload_len,
                          uint8_t *scratch, int32_t scratch_len)
 {
-    loop_conn_t    *c = &l->conns[slot];
-    loop_session_t *s = session_find(l, c->session);
+    loop_conn_t *c = &l->conns[slot];
+    session_t   *s = session_lookup(l->sessions, c->session);
     wal_rec_t       rec;
     err_t           e;
     uint16_t        ack_flags;
@@ -533,7 +506,8 @@ static void arm_conns(loop_t *l)
 
 /* ---- public ---- */
 
-result_t loop_init(loop_t *l, err_t *e, wal_t *wal, uint16_t port,
+result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
+                   session_table_t *sessions, uint16_t port,
                    uint32_t ring_entries)
 {
     sockaddr_in_t addr;
@@ -543,9 +517,9 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal, uint16_t port,
 
     mem_zero((uint8_t *)l, (int32_t)sizeof(*l));
     l->wal = wal;
+    l->sessions = sessions;
     l->listen_fd = -1;
     l->signal_fd = -1;
-    l->next_session = 1;
 
     for (i = 0; i < LOOP_MAX_CONNS; i++)
         l->conns[i].fd = -1;

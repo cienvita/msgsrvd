@@ -112,7 +112,7 @@ static result_t seg_table_load(wal_t *w, err_t *e, uint8_t *scratch,
 
 result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
                   int64_t seg_capacity, uint8_t *scratch, int32_t scratch_len,
-                  wal_open_t *out)
+                  wal_open_t *out, wal_rec_cb_t cb, void *ctx)
 {
     result_t r;
     int32_t  i;
@@ -199,7 +199,7 @@ result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
             return r;
         }
 
-        r = wal_seg_recover(&seg, e, scratch, scratch_len, &scan);
+        r = wal_seg_recover(&seg, e, scratch, scratch_len, &scan, cb, ctx);
         if (!result_ok(r)) {
             wal_seg_close(&seg, e);
             os_close(e, w->dir_fd);

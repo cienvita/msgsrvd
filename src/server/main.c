@@ -6,6 +6,7 @@
 #include "proto/msg.h"
 #include "wal/wal.h"
 #include "server/loop.h"
+#include "server/session.h"
 #include "server/selfcheck.h"
 #include "sys/os.h"
 
@@ -117,10 +118,11 @@ static void usage(void)
 
 static int run_server(const char *dir, uint16_t port, int64_t seg_size)
 {
-    err_t      e;
-    wal_t      wal;
-    wal_open_t info;
-    loop_t     loop;
+    err_t           e;
+    wal_t           wal;
+    wal_open_t      info;
+    loop_t          loop;
+    session_table_t sessions;
     int32_t    sig_fd = -1;
     uint64_t   mask = SIGMASK(SIGINT) | SIGMASK(SIGTERM);
     int        rc = 1;
@@ -136,8 +138,16 @@ static int run_server(const char *dir, uint16_t port, int64_t seg_size)
         return 1;
     }
 
+    /*
+     * The scan fills the session table as it goes, so deduplication
+     * picks up where the last run left off instead of starting blank
+     * and storing a client's retries a second time.
+     */
+    session_table_init(&sessions);
+
     if (!result_ok(wal_open(&wal, &e, dir, seg_size, scratch,
-                            (int32_t)sizeof(scratch), &info))) {
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
         out(2, "msgsrvd: cannot open the log in ");
         out(2, dir);
         out(2, "\n");
@@ -155,6 +165,8 @@ static int run_server(const char *dir, uint16_t port, int64_t seg_size)
     out_u64(1, info.first_seq);
     out(1, " last=");
     out_u64(1, info.last_seq);
+    out(1, " sessions=");
+    out_u64(1, (uint64_t)sessions.count);
     if (info.torn)
         out(1, " (a torn tail was dropped)");
     out(1, "\n");
@@ -169,7 +181,7 @@ static int run_server(const char *dir, uint16_t port, int64_t seg_size)
         goto out_wal;
     }
 
-    if (!result_ok(loop_init(&loop, &e, &wal, port, 256))) {
+    if (!result_ok(loop_init(&loop, &e, &wal, &sessions, port, 256))) {
         out(2, "msgsrvd: cannot start the event loop. If this is an EL\n"
                "kernel, check kernel.io_uring_disabled: it ships at 2,\n"
                "which turns io_uring off for everything.\n");

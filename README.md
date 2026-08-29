@@ -56,9 +56,14 @@ crash recovery, segment rollover, retention, and an io_uring event
 loop with group commit all work end to end: a write is acknowledged
 only after the flush that covers it, and survives a restart.
 
+Deduplication survives a restart too. The session table is not stored
+beside the log, it is counted back out of it: every record carries the
+session that wrote it and that session's own sequence, and recovery
+already reads every record. A client that resumes its session after a
+restart is told the highest sequence the log holds for it and resends
+from there, and anything at or below that mark is acknowledged rather
+than stored again.
+
 Not built yet. Replication, so a write that asks for a second copy is
-refused rather than accepted on a promise. The Rust client. Sessions
-live in memory, so deduplication does not survive a restart; a client
-resuming one is told the session is unknown and opens a new one, which
-means a retry spanning a restart can be stored twice. Reads and
-subscriptions are refused as unimplemented.
+refused rather than accepted on a promise of one. The Rust client.
+Reads and subscriptions are refused as unimplemented.

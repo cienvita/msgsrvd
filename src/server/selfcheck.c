@@ -9,6 +9,7 @@
 #include "wal/record.h"
 #include "wal/segment.h"
 #include "wal/wal.h"
+#include "server/session.h"
 #include "sys/os.h"
 #include "io/uring.h"
 #include "server/loop.h"
@@ -618,8 +619,8 @@ int selfcheck_wal_segment(void)
         }
         {
             wal_seg_scan_t scan;
-            r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch),
-                                &scan);
+            r = wal_seg_recover(&s, &e, scratch,
+                                (int32_t)sizeof(scratch), &scan, NULL, NULL);
             if (!result_ok(r) || scan.records != 3 || scan.last_seq != 3 ||
                 scan.torn || scan.end_off != expect_off ||
                 s.next_seq != 4 || s.durable_seq != 3) {
@@ -670,7 +671,8 @@ int selfcheck_wal_segment(void)
                 goto out;
             }
         }
-        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        r = wal_seg_recover(&s, &e, scratch,
+                                (int32_t)sizeof(scratch), &scan, NULL, NULL);
         if (!result_ok(r) || scan.records != 2 || scan.last_seq != 1001 ||
             !scan.torn || scan.end_off != third_off ||
             s.next_seq != 1002 || s.write_off != third_off) {
@@ -695,7 +697,8 @@ int selfcheck_wal_segment(void)
             DBG_LOG("wal segment: post-torn reopen failed");
             goto out;
         }
-        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        r = wal_seg_recover(&s, &e, scratch,
+                                (int32_t)sizeof(scratch), &scan, NULL, NULL);
         if (!result_ok(r) || scan.records != 3 || scan.last_seq != 1002 ||
             scan.torn) {
             DBG_LOG("wal segment: rewritten tail not recovered");
@@ -748,7 +751,8 @@ int selfcheck_wal_segment(void)
             DBG_LOG("wal segment: stale-case reopen failed");
             goto out;
         }
-        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        r = wal_seg_recover(&s, &e, scratch,
+                                (int32_t)sizeof(scratch), &scan, NULL, NULL);
         if (!result_ok(r) || scan.records != 2 || !scan.torn ||
             scan.end_off != (int64_t)(2 * rec_size)) {
             DBG_LOG("wal segment: stale record accepted (records=%d)",
@@ -804,7 +808,8 @@ int selfcheck_wal_segment(void)
             DBG_LOG("wal segment: overrun-case reopen failed");
             goto out;
         }
-        r = wal_seg_recover(&s, &e, scratch, (int32_t)sizeof(scratch), &scan);
+        r = wal_seg_recover(&s, &e, scratch,
+                                (int32_t)sizeof(scratch), &scan, NULL, NULL);
         if (!result_ok(r)) {
             DBG_LOG("wal segment: overrunning length failed the recovery");
             goto out;
@@ -888,7 +893,8 @@ int selfcheck_wal_segment(void)
             DBG_LOG("wal segment: block-case reopen failed");
             goto out;
         }
-        r = wal_seg_recover(&s, &e, scratch, block, &scan);
+        r = wal_seg_recover(&s, &e, scratch,
+                                block, &scan, NULL, NULL);
         if (!result_ok(r) || scan.records != 9 || scan.last_seq != 4008 ||
             scan.torn) {
             DBG_LOG("wal segment: multi-block scan found %d records",
@@ -902,7 +908,7 @@ int selfcheck_wal_segment(void)
             wal_seg_scan_t sscan;
             err_init(&se);
             if (result_ok(wal_seg_recover(&s, &se, scratch,
-                                          WAL_REC_HEADER_SIZE, &sscan))) {
+                                WAL_REC_HEADER_SIZE, &sscan, NULL, NULL))) {
                 DBG_LOG("wal segment: undersized scan buffer accepted");
                 goto out;
             }
@@ -965,7 +971,8 @@ int selfcheck_wal(void)
         return 1;
     }
 
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r)) {
         DBG_LOG("wal: open of an empty directory failed");
         dbg_err_print(&e);
@@ -1017,7 +1024,8 @@ int selfcheck_wal(void)
     wal_close(&w, &e);
 
     /* Reopen: every segment scanned, boundaries checked */
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r)) {
         DBG_LOG("wal: reopen failed");
         dbg_err_print(&e);
@@ -1055,7 +1063,8 @@ int selfcheck_wal(void)
     wal_close(&w, &e);
 
     /* What is left still opens, and starts where retention left it */
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r) || info.segments != 1 || info.first_seq != 10 ||
         info.last_seq != 10 || info.records != 1) {
         DBG_LOG("wal: reopen after retention wrong");
@@ -1071,7 +1080,8 @@ int selfcheck_wal(void)
         DBG_LOG("wal: mkdir 2 failed");
         return 1;
     }
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r) ||
         !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
                            payload, 8))) {
@@ -1085,7 +1095,8 @@ int selfcheck_wal(void)
         DBG_LOG("wal: could not corrupt the active segment");
         goto out;
     }
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r)) {
         DBG_LOG("wal: refused to open after a torn tail");
         dbg_err_print(&e);
@@ -1119,7 +1130,8 @@ int selfcheck_wal(void)
         DBG_LOG("wal: mkdir 3 failed");
         return 1;
     }
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r) ||
         !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
                            payload, 8))) {
@@ -1136,7 +1148,7 @@ int selfcheck_wal(void)
         err_t me;
         err_init(&me);
         if (result_ok(wal_open(&w, &me, dir, cap, scratch,
-                               (int32_t)sizeof(scratch), &info))) {
+                               (int32_t)sizeof(scratch), &info, NULL, NULL))) {
             DBG_LOG("wal: opened with a damaged middle segment");
             goto out;
         }
@@ -1150,7 +1162,8 @@ int selfcheck_wal(void)
         DBG_LOG("wal: mkdir 4 failed");
         return 1;
     }
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r) ||
         !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
                            payload, 8))) {
@@ -1178,7 +1191,7 @@ int selfcheck_wal(void)
         err_t ge;
         err_init(&ge);
         if (result_ok(wal_open(&w, &ge, dir, cap, scratch,
-                               (int32_t)sizeof(scratch), &info))) {
+                               (int32_t)sizeof(scratch), &info, NULL, NULL))) {
             DBG_LOG("wal: opened with a hole in the sequence");
             goto out;
         }
@@ -1208,7 +1221,7 @@ int selfcheck_wal(void)
         char      name[WAL_SEG_NAME_MAX];
 
         r = wal_open(&w, &e, dir, roomy, scratch, (int32_t)sizeof(scratch),
-                     &info);
+                     &info, NULL, NULL);
         if (!result_ok(r) ||
             !result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
                                payload, 4))) {
@@ -1245,7 +1258,7 @@ int selfcheck_wal(void)
 
         err_init(&te);
         if (result_ok(wal_open(&w, &te, dir, roomy, scratch,
-                               (int32_t)sizeof(scratch), &info))) {
+                               (int32_t)sizeof(scratch), &info, NULL, NULL))) {
             DBG_LOG("wal: opened with a tear in a middle segment's tail");
             goto out;
         }
@@ -1266,7 +1279,8 @@ int selfcheck_wal(void)
         DBG_LOG("wal: could not create the decoy files");
         goto out;
     }
-    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info);
+    r = wal_open(&w, &e, dir, cap, scratch, (int32_t)sizeof(scratch), &info,
+                     NULL, NULL);
     if (!result_ok(r) || !info.created || info.segments != 1 ||
         info.first_seq != 1) {
         DBG_LOG("wal: decoy files disturbed the open (segments=%d)",
@@ -1288,6 +1302,164 @@ out:
     wal_close(&w, &e);
     tmp_dir_destroy(dir);
     return 1;
+}
+
+/* ---- Session table ---- */
+
+int selfcheck_sessions(void)
+{
+    static session_table_t t;
+    session_t             *a;
+    session_t             *b;
+    int32_t                i;
+
+    session_table_init(&t);
+    if (t.count != 0 || t.next_id != 1) {
+        DBG_LOG("sessions: fresh table wrong");
+        return 1;
+    }
+
+    a = session_create(&t);
+    b = session_create(&t);
+    if (!a || !b || a->id != 1 || b->id != 2 ||
+        a->last_client_seq != 0 || t.count != 2) {
+        DBG_LOG("sessions: ids not issued in order");
+        return 1;
+    }
+
+    if (session_lookup(&t, 1) != a || session_lookup(&t, 2) != b ||
+        session_lookup(&t, 0) != NULL || session_lookup(&t, 99) != NULL) {
+        DBG_LOG("sessions: lookup wrong");
+        return 1;
+    }
+
+    /* A high-water mark rises and never falls */
+    session_observe(&t, 1, 5);
+    if (a->last_client_seq != 5) {
+        DBG_LOG("sessions: observe did not raise the mark");
+        return 1;
+    }
+    session_observe(&t, 1, 3);
+    if (a->last_client_seq != 5) {
+        DBG_LOG("sessions: observe lowered the mark");
+        return 1;
+    }
+
+    /* A session seen only in the log is added */
+    session_observe(&t, 7, 2);
+    if (t.count != 3 || !session_lookup(&t, 7) ||
+        session_lookup(&t, 7)->last_client_seq != 2) {
+        DBG_LOG("sessions: a recovered session was not added");
+        return 1;
+    }
+
+    /*
+     * The one that matters. An id seen in the log has to push the
+     * counter past it, or the next client is handed an identity that
+     * already has records and a high-water mark, and its first write
+     * is discarded as a duplicate of a stranger's.
+     */
+    session_observe(&t, 500, 9);
+    if (t.next_id <= 500) {
+        DBG_LOG("sessions: next id did not clear a recovered id");
+        return 1;
+    }
+    {
+        session_t *fresh = session_create(&t);
+
+        if (!fresh || fresh->id <= 500) {
+            DBG_LOG("sessions: new session reused a recovered id");
+            return 1;
+        }
+        if (fresh->last_client_seq != 0) {
+            DBG_LOG("sessions: new session inherited a high-water mark");
+            return 1;
+        }
+    }
+
+    /* Records with no client behind them are not sessions */
+    {
+        int32_t before = t.count;
+
+        session_observe(&t, 0, 4);
+        if (t.count != before) {
+            DBG_LOG("sessions: an internal record created a session");
+            return 1;
+        }
+    }
+
+    /* Filling the table drops the oldest, and ids keep climbing */
+    session_table_init(&t);
+    for (i = 0; i < SESSION_MAX; i++)
+        session_create(&t);
+    if (t.count != SESSION_MAX || t.evicted != 0) {
+        DBG_LOG("sessions: table did not fill cleanly");
+        return 1;
+    }
+    {
+        uint64_t   next;
+        session_t *extra;
+
+        /*
+         * Give the session about to be evicted a mark, or the slot it
+         * leaves behind is already zero and reusing it without
+         * clearing looks the same as clearing it.
+         */
+        session_observe(&t, 1, 77);
+        next = t.next_id;
+        extra = session_create(&t);
+
+        if (!extra || extra->id != next || t.count != SESSION_MAX ||
+            t.evicted != 1) {
+            DBG_LOG("sessions: overflow did not evict exactly one");
+            return 1;
+        }
+        /* The slot is reused; what was in it must not carry over */
+        if (extra->last_client_seq != 0) {
+            DBG_LOG("sessions: reused slot kept the old high-water mark");
+            return 1;
+        }
+        if (session_lookup(&t, 1) != NULL) {
+            DBG_LOG("sessions: overflow kept the oldest session");
+            return 1;
+        }
+    }
+
+    /*
+     * On a full table an id older than everything held is dropped
+     * rather than allowed to push out a newer one. Filled from a range
+     * that starts well above zero, so there is room for an id below
+     * all of them that is genuinely absent.
+     */
+    {
+        uint64_t before_next;
+
+        session_table_init(&t);
+        for (i = 0; i < SESSION_MAX; i++)
+            session_observe(&t, (uint64_t)(100 + i), 1);
+        if (t.count != SESSION_MAX || session_lookup(&t, 100) == NULL) {
+            DBG_LOG("sessions: fill by observation wrong");
+            return 1;
+        }
+
+        before_next = t.next_id;
+        session_observe(&t, 50, 1);
+        if (session_lookup(&t, 50) != NULL) {
+            DBG_LOG("sessions: an older id was admitted to a full table");
+            return 1;
+        }
+        if (session_lookup(&t, 100) == NULL) {
+            DBG_LOG("sessions: an older id displaced a newer one");
+            return 1;
+        }
+        if (t.next_id != before_next) {
+            DBG_LOG("sessions: an older id moved the counter");
+            return 1;
+        }
+    }
+
+    DBG_LOG("sessions: ok");
+    return 0;
 }
 
 /* ---- Event loop, driven over a real loopback socket ---- */
@@ -1453,7 +1625,8 @@ int selfcheck_loop(void)
     err_t          e;
     wal_t          w;
     wal_open_t     info;
-    loop_t         l;
+    loop_t          l;
+    session_table_t sessions;
     int32_t        fd = -1;
     int32_t        fd2 = -1;
     msg_header_t   h;
@@ -1469,13 +1642,15 @@ int selfcheck_loop(void)
         return 1;
     }
     if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
-                            (int32_t)sizeof(scratch), &info))) {
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
         DBG_LOG("loop: wal open failed");
         tmp_dir_destroy(dir);
         return 1;
     }
 
-    if (!result_ok(loop_init(&l, &e, &w, 0, 64))) {
+    session_table_init(&sessions);
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0, 64))) {
         DBG_LOG("loop: init failed (io_uring unavailable?), skipping");
         dbg_err_print(&e);
         wal_close(&w, &e);
@@ -1803,7 +1978,7 @@ int selfcheck_loop(void)
         wal_close(&w, &e);
 
         if (!result_ok(wal_open(&w2, &e, dir, 65536, scratch,
-                                (int32_t)sizeof(scratch), &info2))) {
+                                (int32_t)sizeof(scratch), &info2, NULL, NULL))) {
             DBG_LOG("loop: reopen of the log failed");
             goto out_nolp;
         }
@@ -1830,6 +2005,262 @@ out:
 out_nolp:
     tmp_dir_destroy(dir);
     return rc;
+}
+
+/*
+ * Deduplication across a restart. The session table is not written to
+ * the log, it is counted back out of it, so this is the check that the
+ * counting is right.
+ */
+int selfcheck_session_recovery(void)
+{
+    static uint8_t  scratch[4096];
+    static char     dir[64];
+    err_t           e;
+    wal_t           w;
+    wal_open_t      info;
+    loop_t          l;
+    session_table_t sessions;
+    int32_t         fd = -1;
+    uint64_t        session = 0;
+    uint64_t        high = 0;
+
+    err_init(&e);
+    seg_tmp_path(dir, 8);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("session recovery: mkdir failed");
+        return 1;
+    }
+
+    /* First run: three writes on one session */
+    session_table_init(&sessions);
+    if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
+        DBG_LOG("session recovery: first wal open failed");
+        tmp_dir_destroy(dir);
+        return 1;
+    }
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0, 64))) {
+        DBG_LOG("session recovery: loop unavailable, skipping");
+        wal_close(&w, &e);
+        tmp_dir_destroy(dir);
+        return 0;
+    }
+
+    fd = loop_client_connect(l.port);
+    if (fd < 0) {
+        DBG_LOG("session recovery: connect failed");
+        goto fail;
+    }
+    loop_settle(&l, &e);
+    if (!loop_hello(fd, &l, &e, 0, &session, &high) || session == 0) {
+        DBG_LOG("session recovery: hello failed");
+        goto fail;
+    }
+    if (!loop_send_write_batch(fd, 1, 3)) {
+        DBG_LOG("session recovery: writes failed");
+        goto fail;
+    }
+    loop_settle(&l, &e);
+    if (l.writes != 3) {
+        DBG_LOG("session recovery: first run stored %d records",
+                (int32_t)l.writes);
+        goto fail;
+    }
+
+    os_close(&e, fd);
+    fd = -1;
+    loop_settle(&l, &e);
+    loop_shutdown(&l);
+    wal_close(&w, &e);
+
+    /* Second run: rebuild the table from the log alone */
+    session_table_init(&sessions);
+    if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
+        DBG_LOG("session recovery: second wal open failed");
+        tmp_dir_destroy(dir);
+        return 1;
+    }
+    {
+        session_t *s = session_lookup(&sessions, session);
+
+        if (!s) {
+            DBG_LOG("session recovery: the session was not recovered");
+            wal_close(&w, &e);
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+        if (s->last_client_seq != 3) {
+            DBG_LOG("session recovery: high-water came back as %d",
+                    (int32_t)s->last_client_seq);
+            wal_close(&w, &e);
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+        if (sessions.next_id <= session) {
+            DBG_LOG("session recovery: next id would reuse the old one");
+            wal_close(&w, &e);
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+    }
+
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0, 64))) {
+        DBG_LOG("session recovery: second loop failed");
+        wal_close(&w, &e);
+        tmp_dir_destroy(dir);
+        return 1;
+    }
+
+    fd = loop_client_connect(l.port);
+    if (fd < 0) {
+        DBG_LOG("session recovery: second connect failed");
+        goto fail;
+    }
+    loop_settle(&l, &e);
+
+    /* Resuming reports what the log says, not a blank slate */
+    {
+        uint64_t s2 = 0;
+
+        high = 0;
+        if (!loop_hello(fd, &l, &e, session, &s2, &high)) {
+            DBG_LOG("session recovery: resume failed");
+            goto fail;
+        }
+        if (s2 != session || high != 3) {
+            DBG_LOG("session recovery: resume gave session %d high-water %d",
+                    (int32_t)s2, (int32_t)high);
+            goto fail;
+        }
+    }
+
+    /* A retry spanning the restart is recognised, not stored again */
+    {
+        uint64_t before = l.writes;
+
+        if (!loop_send_write_batch(fd, 2, 2)) {
+            DBG_LOG("session recovery: retry failed");
+            goto fail;
+        }
+        loop_settle(&l, &e);
+        if (l.writes != before || l.dedup_hits != 2) {
+            DBG_LOG("session recovery: retry stored %d records again",
+                    (int32_t)(l.writes - before));
+            goto fail;
+        }
+        if (wal_next_seq(&w) != 4) {
+            DBG_LOG("session recovery: the log grew on a retry");
+            goto fail;
+        }
+    }
+
+    /* And a genuinely new record still lands */
+    if (!loop_send_write_batch(fd, 4, 1)) {
+        DBG_LOG("session recovery: follow-on write failed");
+        goto fail;
+    }
+    loop_settle(&l, &e);
+    if (l.writes != 1 || wal_durable_seq(&w) != 4) {
+        DBG_LOG("session recovery: follow-on write did not land");
+        goto fail;
+    }
+
+    os_close(&e, fd);
+    fd = -1;
+    loop_shutdown(&l);
+    wal_close(&w, &e);
+    tmp_dir_destroy(dir);
+    DBG_LOG("session recovery: deduplication survives a restart: ok");
+
+    /*
+     * A record dropped as torn must not reach the table either. Its
+     * sequence was never made durable, so counting it would raise the
+     * mark past what the log holds and the client's resend of that
+     * record would be discarded as a duplicate of something that is
+     * not there.
+     */
+    seg_tmp_path(dir, 9);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("session recovery: mkdir 9 failed");
+        return 1;
+    }
+    {
+        int32_t   rec_size = wal_rec_size(1);
+        wal_rec_t rec;
+        int32_t   i;
+
+        session_table_init(&sessions);
+        if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                                (int32_t)sizeof(scratch), &info,
+                                session_from_record, &sessions))) {
+            DBG_LOG("session recovery: torn-case open failed");
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+        for (i = 1; i <= 3; i++) {
+            seg_fill_rec(&rec, 1, 42, (uint64_t)i, 1);
+            if (!result_ok(wal_append(&w, &e, &rec, (const uint8_t *)"x",
+                                      scratch, (int32_t)sizeof(scratch)))) {
+                DBG_LOG("session recovery: torn-case append failed");
+                wal_close(&w, &e);
+                tmp_dir_destroy(dir);
+                return 1;
+            }
+        }
+        wal_sync(&w, &e);
+        wal_close(&w, &e);
+
+        /* Damage the third record, so recovery keeps only two */
+        if (!tmp_corrupt(dir, 1, (int64_t)(2 * rec_size) +
+                         WAL_REC_HEADER_SIZE)) {
+            DBG_LOG("session recovery: could not corrupt the record");
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+
+        session_table_init(&sessions);
+        if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                                (int32_t)sizeof(scratch), &info,
+                                session_from_record, &sessions))) {
+            DBG_LOG("session recovery: torn-case reopen failed");
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+        if (!info.torn || info.records != 2) {
+            DBG_LOG("session recovery: torn-case recovered %d records",
+                    (int32_t)info.records);
+            wal_close(&w, &e);
+            tmp_dir_destroy(dir);
+            return 1;
+        }
+        {
+            session_t *s42 = session_lookup(&sessions, 42);
+
+            if (!s42 || s42->last_client_seq != 2) {
+                DBG_LOG("session recovery: torn record reached the table "
+                        "(mark=%d)", s42 ? (int32_t)s42->last_client_seq : -1);
+                wal_close(&w, &e);
+                tmp_dir_destroy(dir);
+                return 1;
+            }
+        }
+        wal_close(&w, &e);
+        tmp_dir_destroy(dir);
+    }
+    DBG_LOG("session recovery: a torn record stays out of the table: ok");
+    return 0;
+
+fail:
+    if (fd >= 0)
+        os_close(&e, fd);
+    loop_shutdown(&l);
+    wal_close(&w, &e);
+    tmp_dir_destroy(dir);
+    return 1;
 }
 
 /*
@@ -2548,7 +2979,11 @@ int selfcheck_run(arena_t *a, err_t *e)
         return 1;
     if (selfcheck_uring())
         return 1;
+    if (selfcheck_sessions())
+        return 1;
     if (selfcheck_loop())
+        return 1;
+    if (selfcheck_session_recovery())
         return 1;
     if (selfcheck_err(e))
         return 1;

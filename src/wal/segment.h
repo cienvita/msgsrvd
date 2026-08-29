@@ -42,6 +42,14 @@ typedef struct {
     int64_t     synced_off;     /* bytes a completed sync covers */
 } wal_seg_t;
 
+/*
+ * Called for each record a scan accepts, in order. Recovery is the one
+ * pass that already reads every record, so anything that has to be
+ * rebuilt from the log rides along with it rather than reading it
+ * again.
+ */
+typedef void (*wal_rec_cb_t)(void *ctx, const wal_rec_t *r);
+
 /* What a recovery scan found. */
 typedef struct {
     uint64_t    records;    /* records accepted */
@@ -98,9 +106,13 @@ result_t wal_seg_open(wal_seg_t *s, err_t *e, int32_t dir_fd,
  *
  * scratch holds one block of the scan and must be able to fit the
  * largest record present, or the scan fails rather than skipping it.
+ *
+ * cb, when given, sees every accepted record and nothing else: a torn
+ * or out-of-sequence record is not passed on.
  */
 result_t wal_seg_recover(wal_seg_t *s, err_t *e, uint8_t *scratch,
-                         int32_t scratch_len, wal_seg_scan_t *out);
+                         int32_t scratch_len, wal_seg_scan_t *out,
+                         wal_rec_cb_t cb, void *ctx);
 
 /* TRUE if a record with this payload still fits in the segment. */
 bool_t wal_seg_fits(const wal_seg_t *s, int32_t payload_len);

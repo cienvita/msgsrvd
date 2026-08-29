@@ -66,10 +66,15 @@ typedef struct {
  *
  * scratch is used for both the directory listing and the record scan,
  * so it must be able to hold the largest record present.
+ *
+ * cb, when given, sees every record recovered across every segment, in
+ * sequence order. This is how state that lives in the log rather than
+ * beside it, the session table above all, is rebuilt without a second
+ * pass over the same bytes.
  */
 result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
                   int64_t seg_capacity, uint8_t *scratch, int32_t scratch_len,
-                  wal_open_t *out);
+                  wal_open_t *out, wal_rec_cb_t cb, void *ctx);
 
 /*
  * Append a record, rolling over to a new segment if it does not fit.
