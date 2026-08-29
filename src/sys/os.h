@@ -357,6 +357,37 @@ static inline void os_exit(int32_t code)
     for (;;) {}
 }
 
+/* ---- signals ---- */
+
+/*
+ * Block the signals in mask so they queue instead of running their
+ * default action, which for SIGTERM is to end the process where it
+ * stands.
+ */
+static inline result_t os_sigblock(err_t *e, uint64_t mask)
+{
+    long r = sys_call4(SYS_rt_sigprocmask, SIG_BLOCK, (long)&mask, 0,
+                       SIGSET_SIZE);
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
+static inline result_t os_signalfd(err_t *e, uint64_t mask, int32_t flags,
+                                   int32_t *fd_out)
+{
+    long r = sys_call4(SYS_signalfd4, -1, (long)&mask, SIGSET_SIZE,
+                       (long)flags);
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *fd_out = (int32_t)r;
+    return RESULT_OK;
+}
+
 /* ---- eventfd ---- */
 
 static inline result_t os_eventfd(err_t *e, uint32_t initval, int32_t flags,

@@ -34,9 +34,31 @@ Wire protocol. Fixed 32-byte header, little-endian, memcpy-decoded.
 Small fixed verb set: WRITE, READ, DELETE, SUBSCRIBE, NOTIFY, ACK, ERR,
 PING, PONG.
 
+## Running
+
+    msgsrvd --dir PATH [--port N] [--segment-size BYTES]
+
+Serves the write-ahead log in PATH, which must already exist. Port
+defaults to 7400 and segments to 256 MiB. SIGINT or SIGTERM stops the
+loop at the end of the pass that receives it, so a shutdown never
+lands between an append and the flush that makes it durable.
+
+    msgsrvd --selfcheck
+
+Runs the in-process checks and exits. There is no external test
+harness: a binary with no libc is easier to exercise from inside
+itself than to link into one.
+
 ## Status
 
-Foundations only. Core types, arena, error stack, wire protocol,
-connection state machine, and io_uring bindings are in place. WAL,
-replication, and the event loop are not yet implemented.
-`make debug && ./build/msgsrvd` runs the in-process self-checks.
+Single node, and durable on that node. The wire protocol, WAL,
+crash recovery, segment rollover, retention, and an io_uring event
+loop with group commit all work end to end: a write is acknowledged
+only after the flush that covers it, and survives a restart.
+
+Not built yet. Replication, so a write that asks for a second copy is
+refused rather than accepted on a promise. The Rust client. Sessions
+live in memory, so deduplication does not survive a restart; a client
+resuming one is told the session is unknown and opens a new one, which
+means a retry spanning a restart can be stored twice. Reads and
+subscriptions are refused as unimplemented.

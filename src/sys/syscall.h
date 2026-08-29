@@ -13,6 +13,7 @@
 #define SYS_write           1
 #define SYS_open            2
 #define SYS_close           3
+#define SYS_rt_sigprocmask  14
 #define SYS_fstat           5
 #define SYS_lseek           8
 #define SYS_mmap            9
@@ -39,6 +40,7 @@
 #define SYS_openat          257
 #define SYS_unlinkat        263
 #define SYS_fallocate       285
+#define SYS_signalfd4       289
 #define SYS_eventfd2        290
 #define SYS_io_uring_setup  425
 #define SYS_io_uring_enter  426

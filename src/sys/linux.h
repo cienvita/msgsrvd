@@ -61,6 +61,27 @@
 #define ECONNRESET  104
 #define ETIMEDOUT   110
 
+/*
+ * Signals. Delivered through a file descriptor rather than a handler:
+ * a handler in a program with no libc needs its own restorer
+ * trampoline, and a descriptor drops into the same ring as everything
+ * else instead of interrupting it. The signals have to be blocked
+ * first, or the default action still fires.
+ */
+#define SIGINT      2
+#define SIGTERM     15
+
+#define SIG_BLOCK   0
+#define SIGSET_SIZE 8               /* bytes of sigset the kernel expects */
+
+#define SFD_CLOEXEC 0x80000
+
+/* One signalfd read returns this many bytes of siginfo. */
+#define SIGNALFD_SIGINFO_SIZE 128
+
+/* Bit for a signal number in a sigset word. */
+#define SIGMASK(n)  ((uint64_t)1 << ((n) - 1))
+
 /* eventfd */
 #define EFD_NONBLOCK 0x800
 #define EFD_CLOEXEC  0x80000

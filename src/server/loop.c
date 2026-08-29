@@ -10,6 +10,7 @@
 #define OP_ACCEPT   1
 #define OP_RECV     2
 #define OP_SEND     3
+#define OP_SIGNAL   4
 
 #define UD_MAKE(op, slot)   (((uint64_t)(op) << 56) | (uint64_t)(uint32_t)(slot))
 #define UD_OP(ud)           ((int32_t)((ud) >> 56))
@@ -18,6 +19,9 @@
 /* Receive and send buffers, one pair per slot. */
 static uint8_t recv_buf[LOOP_MAX_CONNS][LOOP_RECV_CAP];
 static uint8_t send_buf[LOOP_MAX_CONNS][LOOP_SEND_CAP];
+
+/* Somewhere for the signalfd read to land; the contents are not used. */
+static uint8_t signal_buf[SIGNALFD_SIGINFO_SIZE];
 
 /* ---- slots ---- */
 
@@ -419,6 +423,15 @@ static void tick_cb(void *ctx, uint64_t user_data, int32_t res, uint32_t flags)
     case OP_SEND:
         on_send(tc->l, slot, res);
         break;
+    case OP_SIGNAL:
+        tc->l->signal_pending = FALSE;
+        /*
+         * Stop after this pass rather than here, so a record appended
+         * moments ago still gets the flush it is owed.
+         */
+        if (res > 0)
+            tc->l->stop = TRUE;
+        break;
     default:
         break;
     }
@@ -439,6 +452,22 @@ static void arm_accept(loop_t *l)
 
     uring_prep_accept(sqe, l->listen_fd, NULL, NULL, 0, UD_MAKE(OP_ACCEPT, 0));
     l->accept_pending = TRUE;
+}
+
+static void arm_signal(loop_t *l)
+{
+    io_uring_sqe_t *sqe;
+
+    if (l->signal_fd < 0 || l->signal_pending || l->stop)
+        return;
+
+    sqe = uring_get_sqe(&l->ring);
+    if (!sqe)
+        return;
+
+    uring_prep_read(sqe, l->signal_fd, signal_buf,
+                    (uint32_t)sizeof(signal_buf), 0, UD_MAKE(OP_SIGNAL, 0));
+    l->signal_pending = TRUE;
 }
 
 /*
@@ -515,6 +544,7 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal, uint16_t port,
     mem_zero((uint8_t *)l, (int32_t)sizeof(*l));
     l->wal = wal;
     l->listen_fd = -1;
+    l->signal_fd = -1;
     l->next_session = 1;
 
     for (i = 0; i < LOOP_MAX_CONNS; i++)
@@ -573,6 +603,7 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
     tc.scratch_len = (int32_t)sizeof(scratch);
 
     arm_accept(l);
+    arm_signal(l);
     arm_conns(l);
 
     if (wait)
@@ -615,8 +646,15 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
     }
 
     arm_accept(l);
+    arm_signal(l);
     arm_conns(l);
     return uring_submit(&l->ring, e, &submitted);
+}
+
+void loop_set_signal_fd(loop_t *l, int32_t fd)
+{
+    l->signal_fd = fd;
+    l->signal_pending = FALSE;
 }
 
 result_t loop_run(loop_t *l, err_t *e)
@@ -647,6 +685,10 @@ void loop_shutdown(loop_t *l)
     if (l->listen_fd >= 0) {
         os_close(&e, l->listen_fd);
         l->listen_fd = -1;
+    }
+    if (l->signal_fd >= 0) {
+        os_close(&e, l->signal_fd);
+        l->signal_fd = -1;
     }
     uring_destroy(&l->ring);
 }

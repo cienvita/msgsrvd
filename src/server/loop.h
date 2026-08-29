@@ -72,10 +72,11 @@ typedef struct {
     uring_t         ring;
     wal_t          *wal;
     int32_t         listen_fd;
+    int32_t         signal_fd;      /* -1 when nothing is watching signals */
+    bool_t          signal_pending;
     int32_t         port;           /* host byte order, after binding */
     bool_t          accept_pending;
     bool_t          stop;
-    uint8_t         _pad[2];
 
     loop_conn_t     conns[LOOP_MAX_CONNS];
     loop_session_t  sessions[LOOP_MAX_SESSIONS];
@@ -93,6 +94,13 @@ typedef struct {
     uint64_t        dedup_hits;
     uint64_t        flushes;
 } loop_t;
+
+/*
+ * Watch a signalfd. A readable one stops the loop after the pass it
+ * arrives in, so a shutdown never lands between an append and the
+ * flush that makes it durable.
+ */
+void loop_set_signal_fd(loop_t *l, int32_t fd);
 
 /*
  * Bind, listen, and prepare the ring. port 0 asks the kernel to choose
