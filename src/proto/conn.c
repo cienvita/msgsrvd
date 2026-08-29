@@ -6,10 +6,25 @@ void conn_init(conn_t *c, uint8_t *buf, int32_t buf_cap, uint8_t mode)
     c->buf = buf;
     c->buf_cap = buf_cap;
     c->buf_len = 0;
+    c->buf_off = 0;
     c->closed = FALSE;
     c->mode = mode;
-    c->hello_seen = FALSE;
+    c->opened = FALSE;
     c->_pad = 0;
+}
+
+void conn_compact(conn_t *c)
+{
+    int32_t tail;
+
+    if (c->buf_off <= 0)
+        return;
+
+    tail = c->buf_len - c->buf_off;
+    if (tail > 0)
+        mem_copy(c->buf, c->buf + c->buf_off, tail);
+    c->buf_len = tail;
+    c->buf_off = 0;
 }
 
 int32_t conn_recv_append(conn_t *c, const uint8_t *src, int32_t n)
@@ -20,6 +35,7 @@ int32_t conn_recv_append(conn_t *c, const uint8_t *src, int32_t n)
     if (c->closed || n <= 0)
         return 0;
 
+    conn_compact(c);
     space = c->buf_cap - c->buf_len;
     take = n < space ? n : space;
     if (take <= 0)
@@ -83,7 +99,7 @@ static int32_t emit_fatal(conn_t *c, conn_action_t *out, int32_t out_cap,
 
 int32_t conn_feed(conn_t *c, conn_action_t *out, int32_t out_cap)
 {
-    int32_t cursor = 0;
+    int32_t cursor = c->buf_off;
     int32_t n_actions = 0;
 
     if (c->closed || out_cap <= 0)
@@ -145,16 +161,19 @@ int32_t conn_feed(conn_t *c, conn_action_t *out, int32_t out_cap)
         }
 
         /*
-         * Session ordering: exactly one HELLO, and before anything
-         * else. Two ways to violate it, a repeated HELLO and a frame
-         * that arrives without one. Checked before the frame is
-         * complete, since no further bytes can make either legal.
+         * Ordering: exactly one opening frame, and before anything
+         * else. HELLO opens a client connection and REPL_START opens a
+         * replica's, and which one it was is the caller's business,
+         * not this layer's. Two ways to violate it, a repeated opening
+         * frame and a frame that arrives without one. Checked before
+         * the frame is complete, since no further bytes can make
+         * either legal.
          */
         if (c->mode == CONN_MODE_CLIENT) {
-            bool_t is_hello = (hdr.op == MSG_OP_HELLO) ? TRUE : FALSE;
+            bool_t opens = (hdr.op == MSG_OP_HELLO ||
+                            hdr.op == MSG_OP_REPL_START) ? TRUE : FALSE;
 
-            if ((is_hello && c->hello_seen) ||
-                (!is_hello && !c->hello_seen)) {
+            if ((opens && c->opened) || (!opens && !c->opened)) {
                 n_actions += emit_fatal(c, out + n_actions,
                                         out_cap - n_actions,
                                         MSG_ERR_NO_SESSION, hdr.sequence);
@@ -177,25 +196,18 @@ int32_t conn_feed(conn_t *c, conn_action_t *out, int32_t out_cap)
         cursor += total;
 
         /*
-         * Only a frame that was actually emitted opens the session. A
-         * HELLO whose payload has not fully arrived breaks out above
-         * and is re-examined on the next call.
+         * Only a frame that was actually emitted opens the
+         * connection. A HELLO whose payload has not fully arrived
+         * breaks out above and is re-examined on the next call.
          */
-        if (hdr.op == MSG_OP_HELLO)
-            c->hello_seen = TRUE;
+        if (hdr.op == MSG_OP_HELLO || hdr.op == MSG_OP_REPL_START)
+            c->opened = TRUE;
     }
 
     /*
-     * Compact: shift unconsumed bytes to the front of the buffer.
-     * This is where FRAME action pointers are invalidated. The caller
-     * contract requires consuming actions before the next conn_* call.
+     * The parsed bytes stay where they are: the frames just emitted
+     * point into them. conn_compact is what takes the space back.
      */
-    if (cursor > 0) {
-        int32_t tail = c->buf_len - cursor;
-        if (tail > 0)
-            mem_copy(c->buf, c->buf + cursor, tail);
-        c->buf_len = tail;
-    }
-
+    c->buf_off = cursor;
     return n_actions;
 }

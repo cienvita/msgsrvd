@@ -100,24 +100,196 @@ static bool_t parse_u64(const char *s, uint64_t *out_v)
     return TRUE;
 }
 
+/*
+ * Parse "A.B.C.D" and report where it stopped. Numeric only: there is
+ * no resolver here and a node's peers are mesh addresses, which are
+ * the thing a name would have to resolve to anyway.
+ */
+static bool_t parse_ip(const char *s, uint32_t *out_ip, int32_t *out_at)
+{
+    uint32_t ip = 0;
+    int32_t  i = 0;
+    int32_t  octet;
+
+    if (!s)
+        return FALSE;
+
+    for (octet = 0; octet < 4; octet++) {
+        uint32_t v = 0;
+        int32_t  digits = 0;
+
+        while (s[i] >= '0' && s[i] <= '9') {
+            v = v * 10 + (uint32_t)(s[i] - '0');
+            if (v > 255)
+                return FALSE;
+            digits++;
+            i++;
+        }
+        if (digits == 0)
+            return FALSE;
+
+        ip = (ip << 8) | v;
+
+        if (octet < 3) {
+            if (s[i] != '.')
+                return FALSE;
+            i++;
+        }
+    }
+
+    *out_ip = ip;
+    if (out_at)
+        *out_at = i;
+    return TRUE;
+}
+
+/* Parse "A.B.C.D:PORT" into a socket address. */
+static bool_t parse_addr(const char *s, sockaddr_in_t *out)
+{
+    uint32_t ip = 0;
+    uint64_t port = 0;
+    int32_t  i = 0;
+
+    if (!parse_ip(s, &ip, &i))
+        return FALSE;
+
+    if (s[i] != ':')
+        return FALSE;
+    i++;
+
+    if (!parse_u64(s + i, &port) || port == 0 || port > 65535)
+        return FALSE;
+
+    mem_zero((uint8_t *)out, (int32_t)sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_port = htons((uint16_t)port);
+    out->sin_addr = htonl(ip);
+    return TRUE;
+}
+
 static void usage(void)
 {
     out(2,
         "msgsrvd\n"
         "\n"
-        "  msgsrvd --dir PATH [--port N] [--segment-size BYTES]\n"
+        "  msgsrvd --dir PATH [--bind ADDR] [--port N]\n"
+        "          [--segment-size BYTES] [--leader ADDR:PORT]\n"
         "      Serve the write-ahead log in PATH. The directory must\n"
         "      exist. --port 0 asks the kernel to choose one.\n"
-        "      Defaults: --port 7400, --segment-size 268435456.\n"
+        "      Defaults: --bind 127.0.0.1, --port 7400,\n"
+        "      --segment-size 268435456.\n"
+        "\n"
+        "      With --leader this node is a replica: it streams that\n"
+        "      node's log into its own and answers a client's write\n"
+        "      with the leader's address. Without it, it is the leader\n"
+        "      and replicas stream from it.\n"
+        "\n"
+        "  msgsrvd --dir PATH --inspect\n"
+        "      Scan the log, say what is in it, and exit. Nothing is\n"
+        "      listened on. Answers which of two nodes is further\n"
+        "      along, which is what a promotion has to know.\n"
         "\n"
         "  msgsrvd --selfcheck\n"
         "      Run the in-process checks and exit.\n");
 }
 
+/* ---- log ---- */
+
+/* The one line both modes print about a log they have just scanned. */
+static void report_log(const char *dir, const wal_open_t *info,
+                       int32_t sessions)
+{
+    out(1, "msgsrvd: log ");
+    out(1, dir);
+    out(1, " segments=");
+    out_u64(1, (uint64_t)info->segments);
+    out(1, " records=");
+    out_u64(1, info->records);
+    out(1, " first=");
+    out_u64(1, info->first_seq);
+    out(1, " last=");
+    out_u64(1, info->last_seq);
+    out(1, " sessions=");
+    out_u64(1, (uint64_t)sessions);
+    if (info->torn)
+        out(1, " (a torn tail was dropped)");
+    out(1, "\n");
+}
+
+/*
+ * Scan a log and say what is in it, without listening for anything.
+ *
+ * This is what a failover asks: of two replicas, which one is further
+ * along. Nothing else can answer it while the node is stopped, and
+ * starting a node to find out means binding a port and joining a
+ * cluster to read one number.
+ */
+static int inspect_log(const char *dir, int64_t seg_size)
+{
+    err_t           e;
+    wal_t           wal;
+    wal_open_t      info;
+    session_table_t sessions;
+
+    err_init(&e);
+
+    if (!crc32c_available()) {
+        out(2, "msgsrvd: this CPU has no SSE4.2, which CRC32C needs\n");
+        return 1;
+    }
+
+    session_table_init(&sessions);
+
+    if (!result_ok(wal_open(&wal, &e, dir, seg_size, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
+        out(2, "msgsrvd: cannot open the log in ");
+        out(2, dir);
+        out(2, "\n");
+        dbg_err_print(&e);
+        return 1;
+    }
+
+    report_log(dir, &info, sessions.count);
+
+    /*
+     * What keys the log holds, which nothing else can answer: there is
+     * no verb that lists them and no metric that counts them.
+     */
+    {
+        const wal_index_t *ix = wal_index(&wal);
+        int32_t            i;
+
+        for (i = 0; i < wal_index_count(ix); i++) {
+            const wal_index_key_t *k = wal_index_at(ix, i);
+
+            out(1, "msgsrvd:   key ");
+            out_u64(1, k->key);
+            out(1, " records=");
+            out_u64(1, k->count);
+            out(1, " first=");
+            out_u64(1, k->first);
+            out(1, " last=");
+            out_u64(1, k->last);
+            out(1, "\n");
+        }
+        if (ix->unknown > 0) {
+            out(1, "msgsrvd:   and ");
+            out_u64(1, ix->unknown);
+            out(1, " records whose keys did not fit the index\n");
+        }
+    }
+
+    wal_close(&wal, &e);
+    return 0;
+}
+
 /* ---- server ---- */
 
-static int run_server(const char *dir, uint16_t port, int64_t seg_size)
+static int run_server(const char *dir, uint32_t bind_ip, const char *bind_text,
+                      uint16_t port, int64_t seg_size, const char *leader)
 {
+    sockaddr_in_t   leader_addr;
     err_t           e;
     wal_t           wal;
     wal_open_t      info;
@@ -155,21 +327,7 @@ static int run_server(const char *dir, uint16_t port, int64_t seg_size)
         return 1;
     }
 
-    out(1, "msgsrvd: log ");
-    out(1, dir);
-    out(1, " segments=");
-    out_u64(1, (uint64_t)info.segments);
-    out(1, " records=");
-    out_u64(1, info.records);
-    out(1, " first=");
-    out_u64(1, info.first_seq);
-    out(1, " last=");
-    out_u64(1, info.last_seq);
-    out(1, " sessions=");
-    out_u64(1, (uint64_t)sessions.count);
-    if (info.torn)
-        out(1, " (a torn tail was dropped)");
-    out(1, "\n");
+    report_log(dir, &info, sessions.count);
 
     /*
      * Block first, then take the descriptor. Between the two the
@@ -181,7 +339,13 @@ static int run_server(const char *dir, uint16_t port, int64_t seg_size)
         goto out_wal;
     }
 
-    if (!result_ok(loop_init(&loop, &e, &wal, &sessions, port, 256))) {
+    if (leader && !parse_addr(leader, &leader_addr)) {
+        out(2, "msgsrvd: --leader wants an address like 192.0.2.13:7400\n");
+        goto out_wal;
+    }
+
+    if (!result_ok(loop_init(&loop, &e, &wal, &sessions, bind_ip, port,
+                             256))) {
         out(2, "msgsrvd: cannot start the event loop. If this is an EL\n"
                "kernel, check kernel.io_uring_disabled: it ships at 2,\n"
                "which turns io_uring off for everything.\n");
@@ -191,8 +355,24 @@ static int run_server(const char *dir, uint16_t port, int64_t seg_size)
     }
     loop_set_signal_fd(&loop, sig_fd);
 
-    out(1, "msgsrvd: listening on 127.0.0.1:");
+    if (leader && !result_ok(loop_set_leader(&loop, &e, &leader_addr,
+                                             leader))) {
+        out(2, "msgsrvd: cannot take a timer, which a replica needs\n");
+        dbg_err_print(&e);
+        loop_shutdown(&loop);
+        goto out_wal;
+    }
+
+    out(1, "msgsrvd: listening on ");
+    out(1, bind_text);
+    out(1, ":");
     out_u64(1, (uint64_t)loop.port);
+    if (leader) {
+        out(1, " replica of ");
+        out(1, leader);
+    } else {
+        out(1, " leader");
+    }
     out(1, "\n");
 
     if (!result_ok(loop_run(&loop, &e))) {
@@ -228,9 +408,13 @@ out_wal:
 int main(int argc, char **argv)
 {
     const char *dir = NULL;
+    const char *leader = NULL;
+    const char *bind_text = "127.0.0.1";
+    uint32_t    bind_ip = 0x7F000001;
     uint64_t    port = DEFAULT_PORT;
     uint64_t    seg_size = (uint64_t)DEFAULT_SEG_SIZE;
     bool_t      selfcheck = FALSE;
+    bool_t      inspect = FALSE;
     int32_t     i;
 
     for (i = 1; i < argc; i++) {
@@ -241,7 +425,9 @@ int main(int argc, char **argv)
          * that is not there.
          */
         if ((str_eq(argv[i], "--dir") || str_eq(argv[i], "--port") ||
-             str_eq(argv[i], "--segment-size")) && i + 1 >= argc) {
+             str_eq(argv[i], "--segment-size") ||
+             str_eq(argv[i], "--bind") ||
+             str_eq(argv[i], "--leader")) && i + 1 >= argc) {
             out(2, "msgsrvd: ");
             out(2, argv[i]);
             out(2, " needs a value\n\n");
@@ -251,6 +437,8 @@ int main(int argc, char **argv)
 
         if (str_eq(argv[i], "--selfcheck")) {
             selfcheck = TRUE;
+        } else if (str_eq(argv[i], "--inspect")) {
+            inspect = TRUE;
         } else if (str_eq(argv[i], "--dir")) {
             dir = argv[++i];
         } else if (str_eq(argv[i], "--port")) {
@@ -258,6 +446,14 @@ int main(int argc, char **argv)
                 out(2, "msgsrvd: --port must be 0 to 65535\n");
                 return 2;
             }
+        } else if (str_eq(argv[i], "--bind")) {
+            bind_text = argv[++i];
+            if (!parse_ip(bind_text, &bind_ip, NULL)) {
+                out(2, "msgsrvd: --bind wants an address like 192.0.2.13\n");
+                return 2;
+            }
+        } else if (str_eq(argv[i], "--leader")) {
+            leader = argv[++i];
         } else if (str_eq(argv[i], "--segment-size")) {
             if (!parse_u64(argv[++i], &seg_size) ||
                 seg_size < (uint64_t)WAL_REC_MAX_SIZE) {
@@ -296,5 +492,9 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    return run_server(dir, (uint16_t)port, (int64_t)seg_size);
+    if (inspect)
+        return inspect_log(dir, (int64_t)seg_size);
+
+    return run_server(dir, bind_ip, bind_text, (uint16_t)port,
+                      (int64_t)seg_size, leader);
 }

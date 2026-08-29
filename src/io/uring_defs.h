@@ -27,6 +27,7 @@ enum {
     IORING_OP_READ_FIXED    = 4,
     IORING_OP_WRITE_FIXED   = 5,
     IORING_OP_ACCEPT        = 13,
+    IORING_OP_CONNECT       = 16,
     IORING_OP_RECV          = 27,
     IORING_OP_SEND          = 26,
     IORING_OP_CLOSE         = 19,

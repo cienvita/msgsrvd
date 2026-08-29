@@ -4,6 +4,7 @@
 #include "core/types.h"
 #include "core/err.h"
 #include "wal/segment.h"
+#include "wal/index.h"
 
 /*
  * The write-ahead log: a directory of segments, one of them active.
@@ -46,6 +47,13 @@ typedef struct {
     uint64_t    seg_base[WAL_MAX_SEGMENTS];
     int32_t     seg_count;
     int32_t     _pad2;
+
+    /*
+     * Where each key lives. Built by the recovery scan and kept up to
+     * date by appends, so a reader after one key does not have to walk
+     * the whole log to find where it starts and ends.
+     */
+    wal_index_t index;
 } wal_t;
 
 /* What opening the log found. */
@@ -107,6 +115,73 @@ uint64_t wal_first_seq(const wal_t *w);
  */
 result_t wal_retain(wal_t *w, err_t *e, uint64_t keep_from,
                     int32_t *removed_out);
+
+/*
+ * A read position in the log.
+ *
+ * Replication is the first reader: a replica names the sequence it
+ * wants and the leader sends whole records from there. The cursor
+ * holds its own read-only descriptor rather than borrowing the log's,
+ * which is the append point and moves under it.
+ *
+ * There is no index from sequence to offset, so seeking scans the
+ * segment that holds the sequence from its start. The cursor is what
+ * keeps that a one-off: it remembers where it stopped, and streaming
+ * on from there is a read at a known offset. A reader that seeks per
+ * batch instead of holding a cursor would be rescanning the log for
+ * every batch it sends.
+ */
+typedef struct {
+    int32_t     fd;             /* -1 when nothing is open */
+    int32_t     _pad;
+    uint64_t    seg_base;       /* segment the descriptor refers to */
+    int64_t     off;            /* offset of the next record */
+    uint64_t    next_seq;       /* sequence of the next record */
+} wal_cursor_t;
+
+void wal_cursor_init(wal_cursor_t *c);
+
+/*
+ * Place the cursor at seq. ERR_INVALID if the log does not hold it,
+ * which is either a replica behind the retained log or one ahead of
+ * this one, and neither is recoverable by streaming.
+ *
+ * scratch must hold the largest record present, as for recovery.
+ */
+result_t wal_cursor_seek(wal_t *w, err_t *e, wal_cursor_t *c, uint64_t seq,
+                         uint8_t *scratch, int32_t scratch_len);
+
+/*
+ * Copy whole records from the cursor into buf, stopping at limit_seq,
+ * at the end of the written log, or when the next record would not
+ * fit. Returns the bytes copied in out_len, 0 when there is nothing to
+ * send, and advances the cursor past what it copied.
+ *
+ * Only whole records are copied. A caller streaming these to a replica
+ * can hand on what it gets without having to say where the record
+ * boundaries are.
+ */
+result_t wal_cursor_read(wal_t *w, err_t *e, wal_cursor_t *c,
+                         uint64_t limit_seq, uint8_t *buf, int32_t buf_len,
+                         int32_t *out_len);
+
+result_t wal_cursor_close(wal_cursor_t *c, err_t *e);
+
+/*
+ * Append a record that already carries its sequence, as a replica does
+ * with what the leader sent it.
+ *
+ * The sequence has to be the one this log would assign anyway. A
+ * replica that has drifted from the leader by even one record cannot
+ * be repaired by writing what it was sent, so the mismatch is refused
+ * rather than papered over.
+ */
+result_t wal_append_at(wal_t *w, err_t *e, wal_rec_t *r,
+                       const uint8_t *payload, uint8_t *scratch,
+                       int32_t scratch_len);
+
+/* Where each key lives in this log. */
+const wal_index_t *wal_index(const wal_t *w);
 
 result_t wal_close(wal_t *w, err_t *e);
 

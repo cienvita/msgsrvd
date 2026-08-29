@@ -11,6 +11,10 @@
 #define OP_RECV     2
 #define OP_SEND     3
 #define OP_SIGNAL   4
+#define OP_TIMER    5
+#define OP_REPL_DIAL 6
+#define OP_REPL_RECV 7
+#define OP_REPL_SEND 8
 
 #define UD_MAKE(op, slot)   (((uint64_t)(op) << 56) | (uint64_t)(uint32_t)(slot))
 #define UD_OP(ud)           ((int32_t)((ud) >> 56))
@@ -20,8 +24,37 @@
 static uint8_t recv_buf[LOOP_MAX_CONNS][LOOP_RECV_CAP];
 static uint8_t send_buf[LOOP_MAX_CONNS][LOOP_SEND_CAP];
 
-/* Somewhere for the signalfd read to land; the contents are not used. */
+/*
+ * A replica's slot sends from one of these instead of its own, since
+ * what it carries is WAL records rather than replies.
+ */
+static uint8_t repl_send_buf[LOOP_MAX_REPLICAS][LOOP_REPL_CAP];
+
+/* Follower side: the stream from the leader, and the acks going back. */
+static uint8_t stream_recv_buf[LOOP_REPL_CAP];
+static uint8_t stream_send_buf[MSG_HEADER_SIZE * 2];
+
+/* Somewhere for the signalfd and timerfd reads to land. */
 static uint8_t signal_buf[SIGNALFD_SIGINFO_SIZE];
+static uint8_t timer_buf[TIMERFD_READ_SIZE];
+
+/*
+ * Say something to the journal.
+ *
+ * The loop is otherwise silent, and for the ordinary path that is
+ * right: nothing it does per record is worth a line. A replica that
+ * the leader will not stream to is the exception. It retries for ever
+ * and changes nothing, and without a word from it the only symptom is
+ * a log that stops growing, which nobody is watching yet.
+ */
+static void say(const char *s)
+{
+    int32_t n = 0;
+
+    while (s[n] != '\0')
+        n++;
+    os_write_raw(2, s, (size_t)n);
+}
 
 /* ---- slots ---- */
 
@@ -42,6 +75,24 @@ static void slot_reset(loop_t *l, int32_t i)
 
     mem_zero((uint8_t *)c, (int32_t)sizeof(*c));
     c->fd = -1;
+    c->replica = -1;
+    c->send_buf = send_buf[i];
+    c->send_cap = LOOP_SEND_CAP;
+    wal_cursor_init(&c->sub.cursor);
+}
+
+/* Forget a replica the leader was streaming to. */
+static void replica_release(loop_t *l, int32_t idx)
+{
+    err_t e;
+
+    if (idx < 0 || idx >= LOOP_MAX_REPLICAS)
+        return;
+
+    err_init(&e);
+    wal_cursor_close(&l->peer_cursor[idx], &e);
+    l->peer_live[idx] = FALSE;
+    l->peer_durable[idx] = 0;
 }
 
 /*
@@ -60,6 +111,16 @@ static void slot_release(loop_t *l, int32_t i)
     if (c->recv_pending || c->send_pending)
         return;
 
+    if (c->replica >= 0)
+        replica_release(l, c->replica);
+
+    if (c->sub.cursor.fd >= 0) {
+        err_t se;
+
+        err_init(&se);
+        wal_cursor_close(&c->sub.cursor, &se);
+    }
+
     if (c->fd >= 0) {
         err_init(&e);
         os_close(&e, c->fd);
@@ -76,8 +137,10 @@ static bool_t reply(loop_conn_t *c, int32_t slot, uint16_t op, uint16_t flags,
                     int32_t payload_len)
 {
     msg_header_t h;
-    uint8_t     *out = send_buf[slot] + c->send_len;
-    int32_t      room = LOOP_SEND_CAP - c->send_len;
+    uint8_t     *out = c->send_buf + c->send_len;
+    int32_t      room = c->send_cap - c->send_len;
+
+    (void)slot;
 
     if (room < MSG_HEADER_SIZE + payload_len)
         return FALSE;
@@ -92,18 +155,70 @@ static bool_t reply(loop_conn_t *c, int32_t slot, uint16_t op, uint16_t flags,
     return TRUE;
 }
 
+/*
+ * A record on its way to a subscriber. Unlike every other reply this
+ * one carries the record's own key and type, since a subscriber is
+ * being told about a record rather than about its own request.
+ */
+static bool_t reply_record(loop_conn_t *c, const wal_rec_t *r,
+                           const uint8_t *payload)
+{
+    msg_header_t h;
+    uint8_t     *out = c->send_buf + c->send_len;
+    int32_t      room = c->send_cap - c->send_len;
+    int32_t      len = (int32_t)r->len;
+
+    if (room < MSG_HEADER_SIZE + len)
+        return FALSE;
+
+    h = msg_header_new(MSG_OP_NOTIFY, r->record_type, 0, (uint32_t)len,
+                       r->partition_key, r->seq);
+    msg_encode_header(out, room, &h);
+    if (len > 0)
+        mem_copy(out + MSG_HEADER_SIZE, payload, len);
+
+    c->send_len += MSG_HEADER_SIZE + len;
+    return TRUE;
+}
+
+static int32_t text_len(const char *s)
+{
+    int32_t n = 0;
+
+    while (s && s[n] != '\0')
+        n++;
+    return n;
+}
+
+/*
+ * An ERR with optional text. Only NOT_LEADER carries any: the address
+ * to go to instead, which is the one error a client can act on without
+ * a human.
+ */
+static bool_t reply_err_text(loop_conn_t *c, int32_t slot, uint16_t code,
+                             uint64_t sequence, const char *text)
+{
+    msg_err_payload_t p;
+    uint8_t           buf[MSG_ERR_SIZE + MSG_MAX_ERR_TEXT];
+    int32_t           n = text_len(text);
+
+    if (n > MSG_MAX_ERR_TEXT)
+        n = MSG_MAX_ERR_TEXT;
+
+    p.code = code;
+    p.text_len = (uint16_t)n;
+    p._pad = 0;
+    msg_encode_err(buf, MSG_ERR_SIZE, &p);
+    if (n > 0)
+        mem_copy(buf + MSG_ERR_SIZE, (const uint8_t *)text, n);
+
+    return reply(c, slot, MSG_OP_ERR, 0, sequence, buf, MSG_ERR_SIZE + n);
+}
+
 static bool_t reply_err(loop_conn_t *c, int32_t slot, uint16_t code,
                         uint64_t sequence)
 {
-    msg_err_payload_t p;
-    uint8_t           buf[MSG_ERR_SIZE];
-
-    p.code = code;
-    p.text_len = 0;
-    p._pad = 0;
-    msg_encode_err(buf, MSG_ERR_SIZE, &p);
-
-    return reply(c, slot, MSG_OP_ERR, 0, sequence, buf, MSG_ERR_SIZE);
+    return reply_err_text(c, slot, code, sequence, NULL);
 }
 
 static bool_t reply_ack(loop_conn_t *c, int32_t slot, uint16_t flags,
@@ -158,6 +273,112 @@ static void handle_hello(loop_t *l, int32_t slot, const msg_header_t *h,
     reply_ack(c, slot, MSG_FLAG_ACK_REQ, s->id, s->last_client_seq);
 }
 
+/* ---- acknowledgements ---- */
+
+static void ack_clear(loop_ack_t *a)
+{
+    a->due = FALSE;
+    a->degradable = FALSE;
+    a->flags = 0;
+    a->client_seq = 0;
+    a->wal_seq = 0;
+    a->deadline = 0;
+}
+
+/*
+ * Record that an acknowledgement is owed.
+ *
+ * One slot serves any number of records because the acknowledgement is
+ * cumulative: the highest sequence waiting is the only one that has to
+ * be remembered. The flags accumulate rather than replace, since every
+ * record in the slot is covered by whatever satisfies the strongest of
+ * them, and a client waiting on the stronger level would otherwise be
+ * left waiting by an acknowledgement that named the weaker one.
+ *
+ * The deadline belongs to the first record to wait, not the last. A
+ * later record extending it would let a steady stream of writes keep a
+ * stalled one waiting for ever.
+ */
+static void ack_stage(loop_ack_t *a, uint16_t flags, bool_t degradable,
+                      uint64_t client_seq, uint64_t wal_seq,
+                      uint32_t deadline)
+{
+    if (!a->due) {
+        a->due = TRUE;
+        a->deadline = deadline;
+    }
+    a->flags = (uint16_t)(a->flags | flags);
+    if (degradable)
+        a->degradable = TRUE;
+    if (client_seq > a->client_seq)
+        a->client_seq = client_seq;
+    if (wal_seq > a->wal_seq)
+        a->wal_seq = wal_seq;
+}
+
+/* Replicas attached and streaming. */
+static bool_t repl_live(const loop_t *l)
+{
+    int32_t i;
+
+    for (i = 0; i < LOOP_MAX_REPLICAS; i++) {
+        if (l->peer_live[i])
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * The highest sequence any one replica has made durable.
+ *
+ * ANY 1 of the followers, so the best of them is what the rule needs:
+ * a record is on two nodes as soon as the fastest replica has it, and
+ * which one that is changes with whichever flush lands first.
+ */
+static uint64_t repl_best(const loop_t *l)
+{
+    uint64_t best = 0;
+    int32_t  i;
+
+    for (i = 0; i < LOOP_MAX_REPLICAS; i++) {
+        if (l->peer_live[i] && l->peer_durable[i] > best)
+            best = l->peer_durable[i];
+    }
+    return best;
+}
+
+/*
+ * Route an owed acknowledgement to the slot that can satisfy it.
+ *
+ * A write that asked only for local durability is answered by the
+ * flush this pass is about to do. One that asked for a second copy
+ * waits on a replica instead, unless there is no replica to wait for
+ * and the writer said it would take one copy, in which case it is
+ * answered by the same flush and told the copy is not there.
+ */
+static void ack_write(loop_t *l, loop_conn_t *c, const msg_header_t *h,
+                      uint16_t ack_flags, bool_t wants_repl,
+                      bool_t degradable, uint64_t client_seq,
+                      uint64_t wal_seq)
+{
+    (void)h;
+
+    if (!wants_repl) {
+        ack_stage(&c->ack_local, ack_flags, FALSE, client_seq, wal_seq, 0);
+        return;
+    }
+
+    if (!repl_live(l)) {
+        ack_stage(&c->ack_local, (uint16_t)(ack_flags | MSG_FLAG_DEGRADED),
+                  TRUE, client_seq, wal_seq, 0);
+        l->repl_degraded++;
+        return;
+    }
+
+    ack_stage(&c->ack_repl, ack_flags, degradable, client_seq, wal_seq,
+              l->tick + LOOP_REPL_DEADLINE_TICKS);
+}
+
 static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
                          const uint8_t *payload, int32_t payload_len,
                          uint8_t *scratch, int32_t scratch_len)
@@ -167,6 +388,8 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
     wal_rec_t       rec;
     err_t           e;
     uint16_t        ack_flags;
+    bool_t          wants_repl;
+    bool_t          degradable;
 
     if (!s) {
         reply_err(c, slot, MSG_ERR_NO_SESSION, h->sequence);
@@ -175,14 +398,26 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
     }
 
     /*
-     * Replication is not built, so a write that requires it cannot be
-     * honoured. Saying so is the only honest answer; accepting it
-     * would be a promise of a second copy that does not exist. A
-     * client willing to do without says so with ALLOW_DEGRADED, and
-     * the acknowledgement it gets back says the same.
+     * A follower's log is the leader's, arriving over the stream. A
+     * record appended here would sit at a sequence the stream is about
+     * to claim, so the client is sent to the leader instead.
      */
-    if ((h->flags & MSG_FLAG_REPLICATED) &&
-        !(h->flags & MSG_FLAG_ALLOW_DEGRADED)) {
+    if (l->is_follower) {
+        reply_err_text(c, slot, MSG_ERR_NOT_LEADER, h->sequence,
+                       l->leader_text);
+        return;
+    }
+
+    wants_repl = (h->flags & MSG_FLAG_REPLICATED) ? TRUE : FALSE;
+    degradable = (h->flags & MSG_FLAG_ALLOW_DEGRADED) ? TRUE : FALSE;
+
+    /*
+     * With no replica attached there is nothing to wait for, so the
+     * answer is immediate either way: the write is refused, or it is
+     * taken and told plainly that it has one copy. Waiting out the
+     * deadline first would only delay the same answer.
+     */
+    if (wants_repl && !repl_live(l) && !degradable) {
         reply_err(c, slot, MSG_ERR_NO_REPLICAS, h->sequence);
         return;
     }
@@ -190,8 +425,6 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
     ack_flags = (uint16_t)(h->flags &
                            (MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC |
                             MSG_FLAG_REPLICATED));
-    if (h->flags & MSG_FLAG_REPLICATED)
-        ack_flags |= MSG_FLAG_DEGRADED;
 
     /*
      * A resend of something already durable is answered, not appended
@@ -200,12 +433,9 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
      */
     if (h->sequence <= s->last_client_seq) {
         l->dedup_hits++;
-        if (h->flags & MSG_FLAG_ACK_REQ) {
-            c->ack_due = TRUE;
-            c->ack_flags = ack_flags;
-            c->ack_client_seq = s->last_client_seq;
-            c->ack_wal_seq = wal_durable_seq(l->wal);
-        }
+        if (h->flags & MSG_FLAG_ACK_REQ)
+            ack_write(l, c, h, ack_flags, wants_repl, degradable,
+                      s->last_client_seq, wal_durable_seq(l->wal));
         return;
     }
 
@@ -221,21 +451,549 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
     rec.partition_key = h->partition_key;
 
     err_init(&e);
-    if (!result_ok(wal_append(l->wal, &e, &rec, payload, scratch,
-                              scratch_len))) {
-        reply_err(c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
-        return;
+    {
+        result_t r = wal_append(l->wal, &e, &rec, payload, scratch,
+                                scratch_len);
+
+        if (!result_ok(r)) {
+            /*
+             * A record too large for an empty segment is the client's
+             * to fix. Anything else is the log's own trouble, a full
+             * disk above all, and saying so is what points at the node
+             * rather than at the sender.
+             */
+            reply_err(c, slot,
+                      r.code == ERR_INVALID ? MSG_ERR_PAYLOAD_TOO_BIG
+                                            : MSG_ERR_STORAGE,
+                      h->sequence);
+            return;
+        }
     }
 
     l->writes++;
     l->wal_dirty = TRUE;
     s->last_client_seq = h->sequence;
 
-    if (h->flags & MSG_FLAG_ACK_REQ) {
-        c->ack_due = TRUE;
-        c->ack_flags = ack_flags;
-        c->ack_client_seq = h->sequence;
-        c->ack_wal_seq = rec.seq;
+    if (h->flags & MSG_FLAG_ACK_REQ)
+        ack_write(l, c, h, ack_flags, wants_repl, degradable, h->sequence,
+                  rec.seq);
+}
+
+/* ---- subscriptions ---- */
+
+static void arm_timer_now(loop_t *l);
+
+/*
+ * Start following the log.
+ *
+ * from_seq 0 means live only, which is the sequence the log will next
+ * assign; anything else replays from there, and a client that
+ * reconnects names the record after the last one it handled.
+ *
+ * min_seq holds the stream back until this node has flushed that far.
+ * That is read-your-writes across nodes: a client that wrote to the
+ * leader and subscribes here passes the sequence its acknowledgement
+ * named, and is not shown a view older than its own write. The wait is
+ * bounded, and running out is an answer rather than a silence.
+ */
+static void handle_subscribe(loop_t *l, int32_t slot, const msg_header_t *h,
+                             const uint8_t *payload, int32_t payload_len,
+                             uint8_t *scratch, int32_t scratch_len)
+{
+    loop_conn_t     *c = &l->conns[slot];
+    msg_subscribe_t  req;
+    uint64_t         from;
+    err_t            e;
+
+    if (!msg_decode_subscribe(payload, payload_len, &req)) {
+        reply_err(c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
+        c->closing = TRUE;
+        return;
+    }
+
+    if (c->sub.active || c->sub.waiting) {
+        /* One stream per connection. A second would need its own
+         * cursor and its own place in the send buffer. */
+        reply_err(c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
+        return;
+    }
+
+    from = (req.from_seq == 0) ? wal_next_seq(l->wal) : req.from_seq;
+
+    /*
+     * A replay asking from further back than the key has ever existed
+     * starts where it does exist instead. Only the front of the walk
+     * can be skipped this way: where the key's next record falls after
+     * that point is not something a first-and-last index knows.
+     */
+    if (!(h->flags & MSG_FLAG_ALL_KEYS)) {
+        uint64_t key_from;
+        uint64_t key_last;
+
+        if (wal_index_range(wal_index(l->wal), h->partition_key, from,
+                            &key_from, &key_last))
+            from = key_from;
+    }
+
+    err_init(&e);
+    wal_cursor_init(&c->sub.cursor);
+    if (!result_ok(wal_cursor_seek(l->wal, &e, &c->sub.cursor, from, scratch,
+                                   scratch_len))) {
+        /* Older than this node retains, or past the end of its log. */
+        reply_err(c, slot, MSG_ERR_NO_HISTORY, h->sequence);
+        return;
+    }
+
+    c->sub.key = h->partition_key;
+    c->sub.all_keys = (h->flags & MSG_FLAG_ALL_KEYS) ? TRUE : FALSE;
+    c->sub.min_seq = req.min_seq;
+
+    if (req.min_seq > wal_durable_seq(l->wal)) {
+        c->sub.waiting = TRUE;
+        c->sub.deadline = l->tick + LOOP_SUB_DEADLINE_TICKS;
+        arm_timer_now(l);
+        return;         /* answered when it catches up, or gives up */
+    }
+
+    c->sub.active = TRUE;
+    reply(c, slot, MSG_OP_ACK, 0, from, NULL, 0);
+}
+
+/*
+ * Read what this node holds for a key, and stop.
+ *
+ * The same machinery as a subscription, bounded at both ends: it
+ * starts at the oldest record still on disk and ends at whatever was
+ * durable when the request arrived, so a read is a view of the log at
+ * a moment rather than a stream that never finishes. The end is marked
+ * with an empty NOTIFY carrying LAST, which is what that flag is for.
+ */
+static void handle_read(loop_t *l, int32_t slot, const msg_header_t *h,
+                        const uint8_t *payload, int32_t payload_len,
+                        uint8_t *scratch, int32_t scratch_len)
+{
+    loop_conn_t *c = &l->conns[slot];
+    msg_read_t   req;
+    uint64_t     from;
+    err_t        e;
+
+    if (!msg_decode_read(payload, payload_len, &req)) {
+        reply_err(c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
+        c->closing = TRUE;
+        return;
+    }
+
+    if (c->sub.active || c->sub.waiting) {
+        reply_err(c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
+        return;
+    }
+
+    c->sub.key = h->partition_key;
+    c->sub.all_keys = (h->flags & MSG_FLAG_ALL_KEYS) ? TRUE : FALSE;
+    c->sub.min_seq = req.min_seq;
+    c->sub.once = TRUE;
+    c->sub.until = wal_durable_seq(l->wal);
+    from = wal_first_seq(l->wal);
+
+    /*
+     * What the log knows about where this key lives. It bounds the
+     * walk at both ends: nothing of the key exists before its first
+     * record or after its last, so the records in between are the only
+     * ones worth reading. A key the index has never heard of is read
+     * the long way, which is also how a key that genuinely is not
+     * there answers with nothing.
+     */
+    if (!c->sub.all_keys) {
+        uint64_t key_from;
+        uint64_t key_last;
+
+        if (wal_index_range(wal_index(l->wal), c->sub.key, from, &key_from,
+                            &key_last)) {
+            from = key_from;
+            if (key_last < c->sub.until)
+                c->sub.until = key_last;
+        } else if (wal_index_complete(wal_index(l->wal))) {
+            /*
+             * The index has seen every key in this log and has never
+             * seen this one, so there is nothing to read. Answered
+             * without opening the log at all: the push below finds a
+             * cursor already past its end and says so.
+             */
+            c->sub.until = 0;
+            c->sub.cursor.next_seq = 1;
+            c->sub.active = TRUE;
+            reply(c, slot, MSG_OP_ACK, 0, 0, NULL, 0);
+            return;
+        }
+    }
+
+    err_init(&e);
+    wal_cursor_init(&c->sub.cursor);
+    if (!result_ok(wal_cursor_seek(l->wal, &e, &c->sub.cursor, from, scratch,
+                                   scratch_len))) {
+        reply_err(c, slot, MSG_ERR_NO_HISTORY, h->sequence);
+        return;
+    }
+
+    if (req.min_seq > c->sub.until) {
+        c->sub.waiting = TRUE;
+        c->sub.deadline = l->tick + LOOP_SUB_DEADLINE_TICKS;
+        arm_timer_now(l);
+        return;
+    }
+
+    c->sub.active = TRUE;
+    reply(c, slot, MSG_OP_ACK, 0, c->sub.cursor.next_seq, NULL, 0);
+}
+
+/*
+ * Push what has been flushed since the last pass to every subscriber.
+ *
+ * The read is bounded by the room left in the connection's send
+ * buffer, which is what keeps a slow subscriber from needing the
+ * cursor rewound: a record on the wire is smaller than the same record
+ * on disk, since the frame header is 32 bytes against the record's 56
+ * and the disk copy is padded. Whatever was read therefore fits, and
+ * the cursor never moves past what was sent.
+ */
+static void subs_push(loop_t *l, uint8_t *scratch, int32_t scratch_len)
+{
+    uint64_t durable = wal_durable_seq(l->wal);
+    int32_t  i;
+
+    for (i = 0; i < LOOP_MAX_CONNS; i++) {
+        loop_conn_t *c = &l->conns[i];
+        int32_t      room;
+        int32_t      got = 0;
+        int32_t      at = 0;
+        err_t        e;
+
+        if (!c->in_use || c->closing)
+            continue;
+
+        /* A stream held for min_seq starts once the node reaches it,
+         * and is refused once it is clear it will not in time. */
+        if (c->sub.waiting) {
+            if (durable >= c->sub.min_seq) {
+                c->sub.waiting = FALSE;
+                c->sub.active = TRUE;
+                /* A read that waited sees the log as it is now, not as
+                 * it was when the request arrived and was short. */
+                if (c->sub.once)
+                    c->sub.until = durable;
+                reply(c, i, MSG_OP_ACK, 0, c->sub.cursor.next_seq, NULL, 0);
+            } else if (l->tick >= c->sub.deadline) {
+                c->sub.waiting = FALSE;
+                reply_err(c, i, MSG_ERR_BEHIND, c->sub.min_seq);
+                err_init(&e);
+                wal_cursor_close(&c->sub.cursor, &e);
+            }
+            continue;
+        }
+
+        if (!c->sub.active || c->send_pending)
+            continue;
+
+        room = c->send_cap - c->send_len;
+        if (room < MSG_HEADER_SIZE)
+            continue;               /* nothing would fit; try next pass */
+        if (room > scratch_len)
+            room = scratch_len;
+
+        if (c->sub.once) {
+            if (c->sub.cursor.next_seq > c->sub.until) {
+                /* Nothing more belongs to this read. */
+                reply(c, i, MSG_OP_NOTIFY, MSG_FLAG_LAST, c->sub.until,
+                      NULL, 0);
+                c->sub.active = FALSE;
+                err_init(&e);
+                wal_cursor_close(&c->sub.cursor, &e);
+                continue;
+            }
+            if (durable > c->sub.until)
+                durable = c->sub.until;
+        }
+
+        err_init(&e);
+        if (!result_ok(wal_cursor_read(l->wal, &e, &c->sub.cursor, durable,
+                                       scratch, room, &got))) {
+            c->closing = TRUE;
+            continue;
+        }
+
+        while (at < got) {
+            wal_rec_t rec;
+            int32_t   size;
+
+            if (!wal_rec_decode(scratch + at, got - at, &rec))
+                break;
+            size = wal_rec_size((int32_t)rec.len);
+            if (size == 0 || at + size > got)
+                break;
+
+            if (c->sub.all_keys || rec.partition_key == c->sub.key) {
+                reply_record(c, &rec, scratch + at + WAL_REC_HEADER_SIZE);
+                l->notified++;
+            }
+            at += size;
+        }
+    }
+}
+
+/* ---- replication: the leader's side ---- */
+
+/*
+ * A replica has named the sequence it wants. Give it a slot, a cursor
+ * into the log, and the larger send buffer its stream needs.
+ *
+ * Nothing has been staged on this connection: REPL_START is its first
+ * frame and it is answered with the stream itself rather than a reply,
+ * so moving the buffer here cannot lose bytes.
+ */
+static void handle_repl_start(loop_t *l, int32_t slot, const msg_header_t *h,
+                              uint8_t *scratch, int32_t scratch_len)
+{
+    loop_conn_t *c = &l->conns[slot];
+    err_t        e;
+    int32_t      idx = -1;
+    int32_t      i;
+
+    if (l->is_follower) {
+        /*
+         * A follower does not own the log it holds, so it cannot serve
+         * a stream from it. Saying where the leader is turns a
+         * misconfigured replica into one that finds its way.
+         */
+        reply_err_text(c, slot, MSG_ERR_NOT_LEADER, h->sequence,
+                       l->leader_text);
+        c->closing = TRUE;
+        return;
+    }
+
+    for (i = 0; i < LOOP_MAX_REPLICAS; i++) {
+        if (!l->peer_live[i]) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        reply_err(c, slot, MSG_ERR_NO_REPLICAS, h->sequence);
+        c->closing = TRUE;
+        return;
+    }
+
+    err_init(&e);
+    wal_cursor_init(&l->peer_cursor[idx]);
+    if (!result_ok(wal_cursor_seek(l->wal, &e, &l->peer_cursor[idx],
+                                   h->sequence, scratch, scratch_len))) {
+        /*
+         * Either older than this log retains or past its end. Neither
+         * is something a stream can repair: the replica needs a copy
+         * of the segments, which is an operator's job.
+         */
+        reply_err(c, slot, MSG_ERR_NO_HISTORY, h->sequence);
+        c->closing = TRUE;
+        return;
+    }
+
+    c->replica = idx;
+    c->send_buf = repl_send_buf[idx];
+    c->send_cap = LOOP_REPL_CAP;
+    c->send_len = 0;
+    l->peer_live[idx] = TRUE;
+    l->peer_durable[idx] = h->sequence - 1;
+    arm_timer_now(l);
+}
+
+/*
+ * Fill each replica's buffer with whatever it has not been sent.
+ *
+ * Only durable records go out. A replica that confirmed a record the
+ * leader had not yet flushed would let a write count two copies when
+ * one of them could still go away.
+ */
+static void repl_stream(loop_t *l)
+{
+    uint64_t limit = wal_durable_seq(l->wal);
+    int32_t  i;
+
+    for (i = 0; i < LOOP_MAX_CONNS; i++) {
+        loop_conn_t *c = &l->conns[i];
+        int32_t      idx = c->replica;
+        int32_t      n = 0;
+        uint64_t     first;
+        err_t        e;
+
+        if (!c->in_use || c->closing || idx < 0)
+            continue;
+        if (c->send_pending || c->send_len > 0)
+            continue;               /* the last chunk has not gone yet */
+
+        first = l->peer_cursor[idx].next_seq;
+        err_init(&e);
+        if (!result_ok(wal_cursor_read(l->wal, &e, &l->peer_cursor[idx],
+                                       limit, c->send_buf + MSG_HEADER_SIZE,
+                                       c->send_cap - MSG_HEADER_SIZE, &n))) {
+            c->closing = TRUE;
+            continue;
+        }
+        if (n == 0)
+            continue;
+
+        {
+            msg_header_t h = msg_header_new(MSG_OP_REPL_DATA, MSG_RECORD_NONE,
+                                            0, (uint32_t)n, 0, first);
+
+            msg_encode_header(c->send_buf, c->send_cap, &h);
+            c->send_len = MSG_HEADER_SIZE + n;
+        }
+        l->repl_records += l->peer_cursor[idx].next_seq - first;
+    }
+}
+
+/* ---- replication: the follower's side ---- */
+
+/* Stage one header-only frame for the leader. */
+static void stream_frame(loop_t *l, uint16_t op, uint64_t sequence)
+{
+    msg_header_t h;
+    int32_t      room = (int32_t)sizeof(stream_send_buf) - l->repl_send_len;
+
+    if (room < MSG_HEADER_SIZE)
+        return;
+
+    h = msg_header_new(op, MSG_RECORD_NONE, 0, 0, 0, sequence);
+    msg_encode_header(stream_send_buf + l->repl_send_len, room, &h);
+    l->repl_send_len += MSG_HEADER_SIZE;
+}
+
+/* Give up the stream once the kernel holds nothing for it. */
+static void stream_release(loop_t *l)
+{
+    err_t e;
+
+    if (l->repl_fd < 0)
+        return;
+    if (l->repl_recv_pending || l->repl_send_pending || l->repl_connecting)
+        return;
+
+    err_init(&e);
+    os_close(&e, l->repl_fd);
+    l->repl_fd = -1;
+    l->repl_closing = FALSE;
+    l->repl_send_len = 0;
+    l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
+}
+
+/*
+ * Apply what the leader sent.
+ *
+ * The checksum and the sequence are both checked before anything is
+ * written. The checksum is the leader's, computed over the same fields
+ * this node will write, so a record that survives the network intact
+ * is stored with the identical bytes; and the sequence has to be the
+ * next one this log expects, since a replica that has drifted cannot
+ * be repaired by writing what it was sent.
+ */
+static void repl_apply(loop_t *l, const uint8_t *p, int32_t n,
+                       uint8_t *scratch, int32_t scratch_len)
+{
+    err_t   e;
+    int32_t at = 0;
+
+    err_init(&e);
+
+    while (at < n) {
+        wal_rec_t rec;
+        int32_t   size;
+
+        if (!wal_rec_decode(p + at, n - at, &rec)) {
+            l->repl_closing = TRUE;
+            return;
+        }
+
+        size = wal_rec_size((int32_t)rec.len);
+        if (size == 0 || at + size > n ||
+            !wal_rec_verify(p + at, n - at, &rec) ||
+            rec.seq != wal_next_seq(l->wal)) {
+            l->repl_closing = TRUE;
+            return;
+        }
+
+        if (!result_ok(wal_append_at(l->wal, &e, &rec,
+                                     p + at + WAL_REC_HEADER_SIZE, scratch,
+                                     scratch_len))) {
+            l->repl_closing = TRUE;
+            return;
+        }
+
+        /*
+         * The session table is fed here as well as by recovery, so a
+         * follower that is promoted knows what its clients had already
+         * made durable and does not hand out an id the log has used.
+         */
+        session_from_record(l->sessions, &rec);
+
+        /* Streaming again, so a refusal after this is news. */
+        l->repl_last_err = 0;
+        l->wal_dirty = TRUE;
+        l->repl_records++;
+        at += size;
+    }
+}
+
+static void on_stream_frame(loop_t *l, const conn_action_t *a,
+                            uint8_t *scratch, int32_t scratch_len)
+{
+    const msg_header_t *h = &a->u.frame.header;
+
+    switch (h->op) {
+    case MSG_OP_REPL_DATA:
+        repl_apply(l, a->u.frame.payload, a->u.frame.payload_len, scratch,
+                   scratch_len);
+        break;
+    case MSG_OP_ERR: {
+        /*
+         * The leader refused the stream. Dialling again is all this
+         * node can do about it, so it keeps doing that; saying so once
+         * is what turns a silent retry loop into something an operator
+         * can act on. Once, not once per attempt: the same refusal
+         * every half second would bury the journal.
+         */
+        uint16_t code = 0;
+        msg_err_payload_t p;
+
+        if (msg_decode_err(a->u.frame.payload, a->u.frame.payload_len, &p))
+            code = p.code;
+
+        if (code != l->repl_last_err) {
+            l->repl_last_err = code;
+            switch (code) {
+            case MSG_ERR_NO_HISTORY:
+                say("msgsrvd: the leader does not hold the sequence this "
+                    "node asked for.\nIts log has to be replaced with a "
+                    "copy of the leader's; streaming cannot repair it.\n");
+                break;
+            case MSG_ERR_NOT_LEADER:
+                say("msgsrvd: the node named as leader is a replica "
+                    "itself.\n");
+                break;
+            case MSG_ERR_NO_REPLICAS:
+                say("msgsrvd: the leader has no room for another "
+                    "replica.\n");
+                break;
+            default:
+                say("msgsrvd: the leader refused the replication "
+                    "stream.\n");
+                break;
+            }
+        }
+        l->repl_closing = TRUE;
+        break;
+    }
+    default:
+        l->repl_closing = TRUE;
+        break;
     }
 }
 
@@ -256,9 +1014,27 @@ static void handle_frame(loop_t *l, int32_t slot, const conn_action_t *a,
     case MSG_OP_PING:
         reply(c, slot, MSG_OP_PONG, 0, h->sequence, NULL, 0);
         break;
-    case MSG_OP_READ:
-    case MSG_OP_DELETE:
+    case MSG_OP_REPL_START:
+        handle_repl_start(l, slot, h, scratch, scratch_len);
+        break;
+    case MSG_OP_REPL_ACK:
+        /*
+         * What a replica has made durable. The frame carries nothing
+         * else: the leader knows what it sent, and the replica only
+         * has to say how far it got.
+         */
+        if (c->replica >= 0)
+            l->peer_durable[c->replica] = h->sequence;
+        break;
     case MSG_OP_SUBSCRIBE:
+        handle_subscribe(l, slot, h, a->u.frame.payload,
+                         a->u.frame.payload_len, scratch, scratch_len);
+        break;
+    case MSG_OP_READ:
+        handle_read(l, slot, h, a->u.frame.payload, a->u.frame.payload_len,
+                    scratch, scratch_len);
+        break;
+    case MSG_OP_DELETE:
         reply_err(c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
         break;
     default:
@@ -353,7 +1129,7 @@ static void on_recv(tick_ctx_t *tc, int32_t slot, int32_t res)
     }
 }
 
-static void on_send(loop_t *l, int32_t slot, int32_t res)
+void loop_send_done(loop_t *l, int32_t slot, int32_t res)
 {
     loop_conn_t *c = &l->conns[slot];
 
@@ -362,20 +1138,119 @@ static void on_send(loop_t *l, int32_t slot, int32_t res)
     if (!c->in_use)
         return;
 
-    if (res < 0) {
+    /*
+     * A send that failed takes what was staged with it. Keeping those
+     * bytes would have the next pass submit the same doomed write, and
+     * a slot with a write in flight is never released, so the
+     * connection would sit there for ever holding what it owns. For a
+     * replica that is one of the leader's two slots, and the node it
+     * belonged to could never rejoin: it would be told there was no
+     * room, by a leader keeping room for a peer that had gone.
+     *
+     * Zero counts as failure for the same reason. A send that moves
+     * nothing, repeated, is the same loop.
+     */
+    if (res <= 0) {
         c->closing = TRUE;
+        c->send_len = 0;
         return;
     }
 
     /*
      * A short write leaves the rest staged; the remaining bytes move
-     * to the front and go out on the next pass.
+     * to the front and go out on the next pass. The buffer is the
+     * slot's own, which for a replica is not the one the slot number
+     * indexes: its stream is carried in a larger buffer of its own.
      */
     if (res < c->send_len) {
-        mem_copy(send_buf[slot], send_buf[slot] + res, c->send_len - res);
+        mem_copy(c->send_buf, c->send_buf + res, c->send_len - res);
         c->send_len -= res;
     } else {
         c->send_len = 0;
+    }
+}
+
+static void on_repl_dial(loop_t *l, int32_t res)
+{
+    err_t e;
+
+    l->repl_connecting = FALSE;
+
+    if (res < 0) {
+        err_init(&e);
+        if (l->repl_fd >= 0)
+            os_close(&e, l->repl_fd);
+        l->repl_fd = -1;
+        l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
+        return;
+    }
+
+    conn_init(&l->repl_conn, stream_recv_buf, LOOP_REPL_CAP,
+              CONN_MODE_INTERNAL);
+    l->repl_send_len = 0;
+    l->repl_closing = FALSE;
+
+    /*
+     * The first sequence this node does not hold. Asking from the next
+     * one rather than from the last durable one is what keeps the
+     * stream free of records it would only discard.
+     */
+    l->repl_acked = wal_durable_seq(l->wal);
+    stream_frame(l, MSG_OP_REPL_START, wal_next_seq(l->wal));
+}
+
+static void on_repl_recv(loop_t *l, int32_t res, uint8_t *scratch,
+                         int32_t scratch_len)
+{
+    conn_action_t actions[4];
+    int32_t       n;
+    int32_t       i;
+
+    l->repl_recv_pending = FALSE;
+
+    if (l->repl_fd < 0)
+        return;
+    if (res <= 0) {
+        l->repl_closing = TRUE;
+        return;
+    }
+
+    conn_recv_commit(&l->repl_conn, res);
+
+    for (;;) {
+        n = conn_feed(&l->repl_conn, actions, 4);
+        if (n == 0)
+            break;
+
+        for (i = 0; i < n; i++) {
+            if (actions[i].type == CONN_ACTION_FRAME)
+                on_stream_frame(l, &actions[i], scratch, scratch_len);
+            else
+                l->repl_closing = TRUE;
+        }
+
+        if (l->repl_closing)
+            break;
+    }
+}
+
+static void on_repl_send(loop_t *l, int32_t res)
+{
+    l->repl_send_pending = FALSE;
+
+    if (l->repl_fd < 0)
+        return;
+    if (res < 0) {
+        l->repl_closing = TRUE;
+        return;
+    }
+
+    if (res < l->repl_send_len) {
+        mem_copy(stream_send_buf, stream_send_buf + res,
+                 l->repl_send_len - res);
+        l->repl_send_len -= res;
+    } else {
+        l->repl_send_len = 0;
     }
 }
 
@@ -394,7 +1269,27 @@ static void tick_cb(void *ctx, uint64_t user_data, int32_t res, uint32_t flags)
         on_recv(tc, slot, res);
         break;
     case OP_SEND:
-        on_send(tc->l, slot, res);
+        loop_send_done(tc->l, slot, res);
+        break;
+    case OP_TIMER:
+        tc->l->timer_pending = FALSE;
+        if (res == TIMERFD_READ_SIZE) {
+            uint64_t fired = 0;
+
+            mem_copy((uint8_t *)&fired, timer_buf, TIMERFD_READ_SIZE);
+            /* Count what expired, not what was noticed: a pass that
+             * ran long must not make a deadline shorter than it is. */
+            tc->l->tick += (uint32_t)fired;
+        }
+        break;
+    case OP_REPL_DIAL:
+        on_repl_dial(tc->l, res);
+        break;
+    case OP_REPL_RECV:
+        on_repl_recv(tc->l, res, tc->scratch, tc->scratch_len);
+        break;
+    case OP_REPL_SEND:
+        on_repl_send(tc->l, res);
         break;
     case OP_SIGNAL:
         tc->l->signal_pending = FALSE;
@@ -444,12 +1339,29 @@ static void arm_signal(loop_t *l)
 }
 
 /*
- * Queue whatever each connection is ready for. Sending takes priority
- * over reading, and neither is queued while the other is in flight, so
- * a slot never has two operations pointing at the same buffer. A slot
- * is given up only once nothing is staged for it and nothing is in
- * flight, since the kernel would otherwise be reading into or sending
- * from buffers already handed to another connection.
+ * Queue whatever each connection is ready for.
+ *
+ * The two directions are independent: a send and a receive may be in
+ * flight at once, since they use different buffers. Only a second
+ * operation in the same direction is barred, which would put the
+ * kernel into a buffer that is already in use.
+ *
+ * They used to alternate, on the reasoning that a reply always
+ * followed the request that caused it. Replication broke that: an
+ * acknowledgement waiting on a second copy is staged passes later than
+ * the write it answers, and by then the connection is holding a
+ * receive that will not complete until the client sends something
+ * else. The reply would wait for a request that the client, waiting
+ * for the reply, has no reason to send.
+ *
+ * Staging into a buffer with a send already in flight is safe: the
+ * kernel was given the length as it stood, and what is appended past
+ * it goes out on the next pass, which is what the short-write path
+ * already does.
+ *
+ * A slot is given up only once nothing is staged for it and nothing is
+ * in flight, since the kernel would otherwise be reading into or
+ * sending from buffers already handed to another connection.
  */
 static void arm_conns(loop_t *l)
 {
@@ -463,23 +1375,19 @@ static void arm_conns(loop_t *l)
         if (!c->in_use)
             continue;
 
-        if (c->recv_pending || c->send_pending)
-            continue;
-
         /*
          * Staged output goes out even on a connection being closed. A
          * protocol error is reported and then the connection ends, so
          * dropping the slot first would close it silently and leave
          * the client to guess.
          */
-        if (c->send_len > 0) {
+        if (c->send_len > 0 && !c->send_pending) {
             sqe = uring_get_sqe(&l->ring);
             if (!sqe)
                 return;
-            uring_prep_send(sqe, c->fd, send_buf[i], (uint32_t)c->send_len,
+            uring_prep_send(sqe, c->fd, c->send_buf, (uint32_t)c->send_len,
                             UD_MAKE(OP_SEND, i));
             c->send_pending = TRUE;
-            continue;
         }
 
         if (c->closing) {
@@ -487,6 +1395,15 @@ static void arm_conns(loop_t *l)
             continue;
         }
 
+        if (c->recv_pending)
+            continue;
+
+        /*
+         * Everything parsed has been handled by now, so the room it
+         * takes can go back. Doing this any earlier would move the
+         * unparsed tail over the frames still being handled.
+         */
+        conn_compact(&c->conn);
         space = conn_recv_space(&c->conn);
         if (space <= 0) {
             /* Nothing was consumed and there is no room to read more. */
@@ -504,11 +1421,213 @@ static void arm_conns(loop_t *l)
     }
 }
 
+/*
+ * The clock, created the first time something needs one: a replica has
+ * attached, or this node has a leader to dial. A node with neither
+ * never has a timer and is woken only by work.
+ */
+static void arm_timer_now(loop_t *l)
+{
+    err_t e;
+
+    if (l->timer_fd >= 0)
+        return;
+
+    err_init(&e);
+    if (!result_ok(os_timerfd(&e, TFD_CLOEXEC, &l->timer_fd))) {
+        l->timer_fd = -1;
+        return;
+    }
+    if (!result_ok(os_timerfd_period(&e, l->timer_fd, LOOP_TICK_NS))) {
+        os_close(&e, l->timer_fd);
+        l->timer_fd = -1;
+    }
+}
+
+static void arm_timer(loop_t *l)
+{
+    io_uring_sqe_t *sqe;
+
+    if (l->timer_fd < 0 || l->timer_pending || l->stop)
+        return;
+
+    sqe = uring_get_sqe(&l->ring);
+    if (!sqe)
+        return;
+
+    uring_prep_read(sqe, l->timer_fd, timer_buf, (uint32_t)sizeof(timer_buf),
+                    0, UD_MAKE(OP_TIMER, 0));
+    l->timer_pending = TRUE;
+}
+
+/* Dial the leader, once the wait since the last attempt has passed. */
+static void repl_dial(loop_t *l)
+{
+    io_uring_sqe_t *sqe;
+    err_t           e;
+    int32_t         fd = -1;
+
+    if (!l->is_follower || l->stop)
+        return;
+    if (l->repl_fd >= 0 || l->repl_connecting)
+        return;
+    if (l->tick < l->repl_next_dial)
+        return;
+
+    err_init(&e);
+    if (!result_ok(os_socket(&e, AF_INET, SOCK_STREAM, 0, &fd))) {
+        l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
+        return;
+    }
+
+    sqe = uring_get_sqe(&l->ring);
+    if (!sqe) {
+        os_close(&e, fd);
+        return;
+    }
+
+    l->repl_fd = fd;
+    l->repl_connecting = TRUE;
+    uring_prep_connect(sqe, fd, &l->leader_addr,
+                       (uint64_t)sizeof(l->leader_addr),
+                       UD_MAKE(OP_REPL_DIAL, 0));
+}
+
+/*
+ * The stream, in both directions at once. Nothing alternates here: the
+ * records coming in and the acknowledgements going back are unrelated
+ * and use separate buffers, and an acknowledgement held until the next
+ * record arrived would be an acknowledgement that never arrived on an
+ * idle leader.
+ */
+static void arm_stream(loop_t *l)
+{
+    io_uring_sqe_t *sqe;
+    int32_t         space;
+
+    if (l->repl_fd < 0 || l->repl_connecting || l->stop)
+        return;
+
+    if (l->repl_closing) {
+        stream_release(l);
+        return;
+    }
+
+    if (l->repl_send_len > 0 && !l->repl_send_pending) {
+        sqe = uring_get_sqe(&l->ring);
+        if (!sqe)
+            return;
+        uring_prep_send(sqe, l->repl_fd, stream_send_buf,
+                        (uint32_t)l->repl_send_len, UD_MAKE(OP_REPL_SEND, 0));
+        l->repl_send_pending = TRUE;
+    }
+
+    if (l->repl_recv_pending)
+        return;
+
+    conn_compact(&l->repl_conn);
+    space = conn_recv_space(&l->repl_conn);
+    if (space <= 0) {
+        l->repl_closing = TRUE;
+        return;
+    }
+
+    sqe = uring_get_sqe(&l->ring);
+    if (!sqe)
+        return;
+    uring_prep_recv(sqe, l->repl_fd, conn_recv_ptr(&l->repl_conn),
+                    (uint32_t)space, UD_MAKE(OP_REPL_RECV, 0));
+    l->repl_recv_pending = TRUE;
+}
+
+/*
+ * Send the acknowledgements this pass has made true.
+ *
+ * The local slot is answered by the flush that has just happened. The
+ * replicated slot waits for a replica to confirm the same sequence,
+ * and stops waiting when the deadline passes or when the last replica
+ * goes away, since there is then nothing left that could confirm it.
+ * What happens then is the writer's choice, made when it sent the
+ * record: one copy and told so, or an error.
+ */
+static void acks_emit(loop_t *l)
+{
+    uint64_t best = repl_best(l);
+    bool_t   live = repl_live(l);
+    int32_t  i;
+
+    for (i = 0; i < LOOP_MAX_CONNS; i++) {
+        loop_conn_t *c = &l->conns[i];
+
+        if (!c->in_use)
+            continue;
+
+        if (c->ack_local.due) {
+            reply_ack(c, i, c->ack_local.flags, c->ack_local.wal_seq,
+                      c->ack_local.client_seq);
+            ack_clear(&c->ack_local);
+        }
+
+        if (!c->ack_repl.due)
+            continue;
+
+        if (best >= c->ack_repl.wal_seq &&
+            wal_durable_seq(l->wal) >= c->ack_repl.wal_seq) {
+            reply_ack(c, i, c->ack_repl.flags, c->ack_repl.wal_seq,
+                      c->ack_repl.client_seq);
+            ack_clear(&c->ack_repl);
+            continue;
+        }
+
+        if (live && l->tick < c->ack_repl.deadline)
+            continue;
+
+        if (c->ack_repl.degradable) {
+            reply_ack(c, i, (uint16_t)(c->ack_repl.flags | MSG_FLAG_DEGRADED),
+                      c->ack_repl.wal_seq, c->ack_repl.client_seq);
+            l->repl_degraded++;
+        } else {
+            /*
+             * The sequence names the highest record the refusal covers,
+             * the same way an acknowledgement names the highest it
+             * satisfies. Every record of this session at that level and
+             * below it is refused, and the client resends or gives up.
+             */
+            reply_err(c, i, MSG_ERR_NO_REPLICAS, c->ack_repl.client_seq);
+        }
+        ack_clear(&c->ack_repl);
+    }
+}
+
+/* Tell the leader how far this node's own flush has got. */
+static void stream_report(loop_t *l)
+{
+    uint64_t durable;
+
+    if (l->repl_fd < 0 || l->repl_connecting || l->repl_closing)
+        return;
+
+    durable = wal_durable_seq(l->wal);
+    if (durable <= l->repl_acked)
+        return;
+
+    /*
+     * Skipped rather than queued when a send is already with the
+     * kernel: the next report carries a sequence at least as high, so
+     * nothing is lost by not staging this one.
+     */
+    if (l->repl_send_pending || l->repl_send_len > 0)
+        return;
+
+    stream_frame(l, MSG_OP_REPL_ACK, durable);
+    l->repl_acked = durable;
+}
+
 /* ---- public ---- */
 
 result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
-                   session_table_t *sessions, uint16_t port,
-                   uint32_t ring_entries)
+                   session_table_t *sessions, uint32_t bind_ip,
+                   uint16_t port, uint32_t ring_entries)
 {
     sockaddr_in_t addr;
     result_t      r;
@@ -520,9 +1639,13 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
     l->sessions = sessions;
     l->listen_fd = -1;
     l->signal_fd = -1;
+    l->timer_fd = -1;
+    l->repl_fd = -1;
 
     for (i = 0; i < LOOP_MAX_CONNS; i++)
-        l->conns[i].fd = -1;
+        slot_reset(l, i);
+    for (i = 0; i < LOOP_MAX_REPLICAS; i++)
+        wal_cursor_init(&l->peer_cursor[i]);
 
     r = uring_init(&l->ring, e, ring_entries);
     if (!result_ok(r))
@@ -540,7 +1663,7 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
     mem_zero((uint8_t *)&addr, (int32_t)sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    addr.sin_addr = htonl(0x7F000001);      /* loopback for now */
+    addr.sin_addr = htonl(bind_ip);
 
     r = os_bind(e, l->listen_fd, &addr);
     if (!result_ok(r))
@@ -570,7 +1693,6 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
     static uint8_t scratch[WAL_REC_MAX_SIZE];
     result_t   r;
     uint32_t   submitted = 0;
-    int32_t    i;
 
     tc.l = l;
     tc.scratch = scratch;
@@ -578,7 +1700,10 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
 
     arm_accept(l);
     arm_signal(l);
+    arm_timer(l);
+    repl_dial(l);
     arm_conns(l);
+    arm_stream(l);
 
     if (wait)
         r = uring_submit_and_wait(&l->ring, e, 1, &submitted);
@@ -609,20 +1734,57 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
     }
 
     /* Only now is an acknowledgement true, so only now is it staged. */
-    for (i = 0; i < LOOP_MAX_CONNS; i++) {
-        loop_conn_t *c = &l->conns[i];
+    acks_emit(l);
 
-        if (!c->in_use || !c->ack_due)
-            continue;
+    /*
+     * Streaming comes after the flush for the same reason: a replica
+     * is sent records that are on this node's disk, never records that
+     * are only in its memory.
+     */
+    if (l->is_follower)
+        stream_report(l);
+    else
+        repl_stream(l);
 
-        reply_ack(c, i, c->ack_flags, c->ack_wal_seq, c->ack_client_seq);
-        c->ack_due = FALSE;
-    }
+    /*
+     * Subscribers are served last, after the flush and after the
+     * replicas. A record reaches a client watching the log only once
+     * it is on this node's disk.
+     */
+    subs_push(l, scratch, (int32_t)sizeof(scratch));
 
     arm_accept(l);
     arm_signal(l);
+    arm_timer(l);
+    repl_dial(l);
     arm_conns(l);
+    arm_stream(l);
     return uring_submit(&l->ring, e, &submitted);
+}
+
+result_t loop_set_leader(loop_t *l, err_t *e, const sockaddr_in_t *addr,
+                         const char *text)
+{
+    if (!l || !addr) {
+        ERR_PUSH(e, ERR_INVALID);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    l->is_follower = TRUE;
+    l->leader_addr = *addr;
+    l->leader_text = text;
+    l->repl_next_dial = 0;
+    arm_timer_now(l);
+
+    if (l->timer_fd < 0) {
+        /*
+         * Without a clock the stream could be dialled once and never
+         * again, which is worse than refusing to start.
+         */
+        ERR_PUSH(e, ERR_SYSCALL);
+        return RESULT_ERR(ERR_SYSCALL, 0);
+    }
+    return RESULT_OK;
 }
 
 void loop_set_signal_fd(loop_t *l, int32_t fd)
@@ -656,6 +1818,19 @@ void loop_shutdown(loop_t *l)
         }
     }
 
+    for (i = 0; i < LOOP_MAX_REPLICAS; i++) {
+        wal_cursor_close(&l->peer_cursor[i], &e);
+        l->peer_live[i] = FALSE;
+    }
+
+    if (l->repl_fd >= 0) {
+        os_close(&e, l->repl_fd);
+        l->repl_fd = -1;
+    }
+    if (l->timer_fd >= 0) {
+        os_close(&e, l->timer_fd);
+        l->timer_fd = -1;
+    }
     if (l->listen_fd >= 0) {
         os_close(&e, l->listen_fd);
         l->listen_fd = -1;

@@ -357,6 +357,23 @@ static inline void os_exit(int32_t code)
     for (;;) {}
 }
 
+/*
+ * Half-close a socket. A send on a descriptor shut for writing fails
+ * with EPIPE every time, which is what makes it useful to a test: it
+ * needs a send that cannot succeed, and closing the peer only makes
+ * one that usually does not.
+ */
+static inline result_t os_shutdown(err_t *e, int32_t fd, int32_t how)
+{
+    long r = sys_call2(SYS_shutdown, (long)fd, (long)how);
+
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
 /* ---- signals ---- */
 
 /*
@@ -399,6 +416,42 @@ static inline result_t os_eventfd(err_t *e, uint32_t initval, int32_t flags,
         return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
     }
     *fd_out = (int32_t)r;
+    return RESULT_OK;
+}
+
+/* ---- timerfd ---- */
+
+static inline result_t os_timerfd(err_t *e, int32_t flags, int32_t *fd_out)
+{
+    long r = sys_call2(SYS_timerfd_create, CLOCK_MONOTONIC, (long)flags);
+
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *fd_out = (int32_t)r;
+    return RESULT_OK;
+}
+
+/*
+ * Arm a repeating timer. period_ns of 0 disarms it, which is how a
+ * node that no longer needs a clock stops being woken by one.
+ */
+static inline result_t os_timerfd_period(err_t *e, int32_t fd,
+                                         int64_t period_ns)
+{
+    itimerspec_t spec;
+    long         r;
+
+    spec.interval.tv_sec = period_ns / 1000000000;
+    spec.interval.tv_nsec = period_ns % 1000000000;
+    spec.value = spec.interval;
+
+    r = sys_call4(SYS_timerfd_settime, (long)fd, 0, (long)&spec, 0);
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
     return RESULT_OK;
 }
 

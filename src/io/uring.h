@@ -195,6 +195,27 @@ static inline void uring_prep_fsync(io_uring_sqe_t *sqe, int32_t fd,
     sqe->buf_index = 0;
 }
 
+/*
+ * The address has to outlive the submission: the kernel reads it when
+ * the operation runs, not when it is queued, so a caller cannot pass
+ * one off its own stack.
+ */
+static inline void uring_prep_connect(io_uring_sqe_t *sqe, int32_t fd,
+                                      const void *addr, uint64_t addrlen,
+                                      uint64_t user_data)
+{
+    sqe->opcode = IORING_OP_CONNECT;
+    sqe->flags = 0;
+    sqe->ioprio = 0;
+    sqe->fd = fd;
+    sqe->off = addrlen;
+    sqe->addr = (uint64_t)(uintptr_t)addr;
+    sqe->len = 0;
+    sqe->op_flags = 0;
+    sqe->user_data = user_data;
+    sqe->buf_index = 0;
+}
+
 static inline void uring_prep_close(io_uring_sqe_t *sqe, int32_t fd,
                                     uint64_t user_data)
 {

@@ -1,5 +1,10 @@
 CC      := gcc
 CFLAGS  := -std=c99 -Wall -Wextra -Wpedantic -Werror
+# Static. The program reaches the kernel through its own syscall stubs and
+# takes nothing from libc but the startup, so linking against a particular
+# glibc buys nothing and costs a version to match between the machine that
+# builds it and the fleet that runs it.
+LDFLAGS := -static
 STRIP   := strip
 BUILD   := build
 SRCDIR  := src
@@ -30,7 +35,7 @@ tiny:    $(BUILD)/tiny
 tinye:   $(BUILD)/tinye
 
 $(BUILD)/msgsrvd: $(MSGSRVD_SRCS) $(HDRS) | $(BUILD)
-	$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $(MSGSRVD_SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -I$(SRCDIR) -o $@ $(MSGSRVD_SRCS)
 
 debug: CFLAGS += -O0 -g -DMSGSRVD_DEBUG
 debug: $(BUILD)/msgsrvd
@@ -42,10 +47,19 @@ $(BUILD)/tiny $(BUILD)/tinye: $(BUILD)/%: src/server/%.c $(HDRS) | $(BUILD)
 $(BUILD):
 	mkdir -p $@
 
+# The Rust client. Its tests run a real server, so the binary is a
+# prerequisite rather than something the test run is expected to find.
+client:
+	cd clients/rust && cargo build --release
+
+client-test: $(BUILD)/msgsrvd
+	cd clients/rust && cargo test --lib --test integration
+	cd clients/rust && cargo test --doc
+
 docker:
 	docker build -t msgsrvd-tiny:latest .
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all debug clean docker msgsrvd tiny tinye
+.PHONY: all debug clean docker msgsrvd tiny tinye client client-test

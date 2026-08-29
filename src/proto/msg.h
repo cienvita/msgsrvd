@@ -27,6 +27,23 @@
  * keyed on (session, sequence), so resuming a session lets the server
  * discard records it already holds when a client resends after a
  * reconnect.
+ *
+ * Replication rides the same port and the same framing, and a
+ * connection declares which kind it is with its first frame: HELLO for
+ * a client, REPL_START for a replica. A replica connection carries no
+ * session, since it is not a client and has nothing to deduplicate.
+ *
+ * The replica dials the leader, not the other way round, because the
+ * sequence the stream starts from is the replica's to name. Its
+ * REPL_START carries the first sequence it does not hold. After that
+ * the leader sends REPL_DATA and the replica answers REPL_ACK after
+ * each of its own flushes, one message type in each direction as the
+ * design has it.
+ *
+ * REPL_DATA payloads are WAL records in their on-disk form, not
+ * protocol frames: the replica writes what it is given after checking
+ * the checksum and that the sequence follows its own, and does not
+ * otherwise interpret them.
  */
 
 #define MSG_MAGIC       0x4D534756  /* "MSGV" in little-endian */
@@ -62,11 +79,14 @@ enum {
     MSG_OP_ERR          = 7,    /* server -> client: error response */
     MSG_OP_PING         = 8,    /* keepalive request */
     MSG_OP_PONG         = 9,    /* keepalive response */
-    MSG_OP_HELLO        = 10    /* client -> server: open or resume session */
+    MSG_OP_HELLO        = 10,   /* client -> server: open or resume session */
+    MSG_OP_REPL_START   = 11,   /* replica -> leader: stream from sequence */
+    MSG_OP_REPL_DATA    = 12,   /* leader -> replica: raw WAL record bytes */
+    MSG_OP_REPL_ACK     = 13    /* replica -> leader: its durable sequence */
 };
 
 #define MSG_OP_MIN MSG_OP_WRITE
-#define MSG_OP_MAX MSG_OP_HELLO
+#define MSG_OP_MAX MSG_OP_REPL_ACK
 
 /*
  * Record type, 16-bit slot in the header reserved for future routing.
@@ -85,6 +105,11 @@ enum {
  * conditions: the frame was well-formed and the connection survives,
  * the client is expected to act on the code and carry on.
  *
+ * STORAGE is the one that is not about the frame at all: the record
+ * was fine and the log could not take it, which on a full disk is the
+ * answer an operator needs to see. Reporting that as PAYLOAD_TOO_BIG
+ * would send them looking at the client.
+ *
  * Business-level errors (NOT_FOUND and the like) belong to the
  * projector above this layer and are not listed here.
  */
@@ -99,7 +124,9 @@ enum {
     MSG_ERR_NO_SESSION      = 7,    /* frame before HELLO, or a second HELLO */
     MSG_ERR_SESSION_UNKNOWN = 8,    /* resume of an expired or unknown session */
     MSG_ERR_UNSUPPORTED     = 9,    /* verb understood but not implemented yet */
-    MSG_ERR_NO_REPLICAS     = 10    /* replication asked for, none available */
+    MSG_ERR_NO_REPLICAS     = 10,   /* replication asked for, none available */
+    MSG_ERR_NO_HISTORY      = 11,   /* replica asked for a sequence not held */
+    MSG_ERR_STORAGE         = 12    /* the log could not take the record */
 };
 
 /*
@@ -125,7 +152,8 @@ enum {
     MSG_FLAG_REPLICATED     = (1 << 2),     /* replica confirm before ACK */
     MSG_FLAG_ALLOW_DEGRADED = (1 << 3),     /* accept write even if replicas down */
     MSG_FLAG_DEGRADED       = (1 << 4),     /* response: accepted but not replicated */
-    MSG_FLAG_LAST           = (1 << 5)      /* final record in a subscribe stream */
+    MSG_FLAG_LAST           = (1 << 5),     /* final record in a subscribe stream */
+    MSG_FLAG_ALL_KEYS       = (1 << 6)      /* subscribe: every key, not one */
 };
 
 /*
@@ -252,6 +280,21 @@ STATIC_ASSERT(sizeof(msg_read_t) == MSG_READ_SIZE, read_size);
  * is what makes delivery at-least-once rather than at-most-once.
  *
  * min_seq is the same barrier as READ.
+ *
+ * The header's partition_key selects what is delivered, or every
+ * record when ALL_KEYS is set. Without that flag there would be no way
+ * to ask for everything, since 0 is a key like any other.
+ *
+ * The reply is an ACK carrying no payload, whose sequence is where the
+ * stream starts. A write's ACK always carries the cumulative client
+ * sequence, so the two cannot be mistaken for each other on a
+ * connection doing both.
+ *
+ * Records then arrive as NOTIFY, one per frame, with the record's own
+ * WAL sequence in the header along with its key and record type. Only
+ * records this node has flushed are sent: a subscriber is told about a
+ * record when the node holding it could survive losing power, not when
+ * it merely has it in hand.
  */
 typedef struct {
     uint64_t    min_seq;

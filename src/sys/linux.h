@@ -48,6 +48,11 @@
 #define IPPROTO_TCP 6
 #define TCP_NODELAY 1
 
+/* shutdown() directions */
+#define SHUT_RD     0
+#define SHUT_WR     1
+#define SHUT_RDWR   2
+
 /* Common errno values */
 #define ENOENT       2
 #define EIO          5
@@ -85,6 +90,33 @@
 /* eventfd */
 #define EFD_NONBLOCK 0x800
 #define EFD_CLOEXEC  0x80000
+
+/*
+ * Timers, also delivered through a descriptor so they land in the ring
+ * with everything else.
+ *
+ * The loop needs one only where something has to happen without a
+ * client or a peer causing it: a replica that has to be dialled again
+ * after its connection dropped, and a write waiting on a second copy
+ * that has to stop waiting at some point. A node with no replication
+ * configured never arms it and keeps a loop whose only clock is the
+ * flush.
+ */
+#define CLOCK_MONOTONIC 1
+#define TFD_CLOEXEC     0x80000
+
+/* One timerfd read returns a u64 count of expirations. */
+#define TIMERFD_READ_SIZE 8
+
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} timespec_t;
+
+typedef struct {
+    timespec_t interval;
+    timespec_t value;
+} itimerspec_t;
 
 /*
  * getdents64 record. The kernel packs these: the name starts at a

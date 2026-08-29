@@ -24,6 +24,7 @@
 #define SYS_socket          41
 #define SYS_connect         42
 #define SYS_accept          43
+#define SYS_shutdown        48
 #define SYS_getsockname     51
 #define SYS_bind            49
 #define SYS_listen          50
@@ -40,6 +41,8 @@
 #define SYS_openat          257
 #define SYS_unlinkat        263
 #define SYS_fallocate       285
+#define SYS_timerfd_create  283
+#define SYS_timerfd_settime 286
 #define SYS_signalfd4       289
 #define SYS_eventfd2        290
 #define SYS_io_uring_setup  425

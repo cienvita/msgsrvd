@@ -110,6 +110,32 @@ static result_t seg_table_load(wal_t *w, err_t *e, uint8_t *scratch,
     return RESULT_OK;
 }
 
+/*
+ * The recovery scan has one callback and two things to fill: the
+ * caller's (the session table) and the log's own key index. This sits
+ * in between so the log keeps its index without every caller having to
+ * remember to.
+ */
+typedef struct {
+    wal_t          *w;
+    wal_rec_cb_t    cb;
+    void           *ctx;
+} wal_scan_ctx_t;
+
+static void wal_scan_record(void *ctx, const wal_rec_t *r)
+{
+    wal_scan_ctx_t *s = (wal_scan_ctx_t *)ctx;
+
+    wal_index_add(&s->w->index, r);
+    if (s->cb)
+        s->cb(s->ctx, r);
+}
+
+const wal_index_t *wal_index(const wal_t *w)
+{
+    return &w->index;
+}
+
 result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
                   int64_t seg_capacity, uint8_t *scratch, int32_t scratch_len,
                   wal_open_t *out, wal_rec_cb_t cb, void *ctx)
@@ -118,6 +144,7 @@ result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
     int32_t  i;
     uint64_t expected;
     uint64_t records = 0;
+    wal_scan_ctx_t scan_ctx;
 
     if (!w || !out || seg_capacity < WAL_REC_HEADER_SIZE ||
         !scratch || scratch_len < WAL_REC_HEADER_SIZE) {
@@ -131,6 +158,7 @@ result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
     w->seg_capacity = seg_capacity;
     w->seg_count = 0;
     w->active.fd = -1;
+    wal_index_init(&w->index);
 
     out->segments = 0;
     out->created = FALSE;
@@ -146,6 +174,10 @@ result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
         ERR_PUSH(e, ERR_STORAGE);
         return r;
     }
+
+    scan_ctx.w = w;
+    scan_ctx.cb = cb;
+    scan_ctx.ctx = ctx;
 
     r = seg_table_load(w, e, scratch, scratch_len);
     if (!result_ok(r)) {
@@ -199,7 +231,8 @@ result_t wal_open(wal_t *w, err_t *e, const char *dir_path,
             return r;
         }
 
-        r = wal_seg_recover(&seg, e, scratch, scratch_len, &scan, cb, ctx);
+        r = wal_seg_recover(&seg, e, scratch, scratch_len, &scan,
+                            wal_scan_record, &scan_ctx);
         if (!result_ok(r)) {
             wal_seg_close(&seg, e);
             os_close(e, w->dir_fd);
@@ -287,7 +320,10 @@ result_t wal_append(wal_t *w, err_t *e, wal_rec_t *r, const uint8_t *payload,
         w->seg_count++;
     }
 
-    return wal_seg_append(&w->active, e, r, payload, scratch, scratch_len);
+    res = wal_seg_append(&w->active, e, r, payload, scratch, scratch_len);
+    if (result_ok(res))
+        wal_index_add(&w->index, r);
+    return res;
 }
 
 result_t wal_sync(wal_t *w, err_t *e)
@@ -364,6 +400,244 @@ result_t wal_retain(wal_t *w, err_t *e, uint64_t keep_from, int32_t *removed_out
 
     if (removed_out)
         *removed_out = drop;
+    return RESULT_OK;
+}
+
+
+/* ---- reading ---- */
+
+/* Index of the segment that holds seq, or -1. */
+static int32_t seg_index_of(const wal_t *w, uint64_t seq)
+{
+    int32_t i;
+
+    for (i = w->seg_count - 1; i >= 0; i--) {
+        if (w->seg_base[i] <= seq)
+            return i;
+    }
+    return -1;
+}
+
+/* Open a read-only descriptor on the segment with this base. */
+static result_t cursor_open_seg(wal_t *w, err_t *e, wal_cursor_t *c,
+                                uint64_t base)
+{
+    char     name[WAL_SEG_NAME_MAX];
+    int32_t  fd = -1;
+    result_t r;
+
+    wal_seg_name(base, name);
+    r = os_openat(e, w->dir_fd, name, O_RDONLY | O_CLOEXEC, 0, &fd);
+    if (!result_ok(r)) {
+        ERR_PUSH(e, ERR_STORAGE);
+        return r;
+    }
+
+    if (c->fd >= 0)
+        os_close(e, c->fd);
+    c->fd = fd;
+    c->seg_base = base;
+    c->off = 0;
+    return RESULT_OK;
+}
+
+void wal_cursor_init(wal_cursor_t *c)
+{
+    c->fd = -1;
+    c->_pad = 0;
+    c->seg_base = 0;
+    c->off = 0;
+    c->next_seq = 0;
+}
+
+result_t wal_cursor_close(wal_cursor_t *c, err_t *e)
+{
+    result_t r = RESULT_OK;
+
+    if (c->fd >= 0)
+        r = os_close(e, c->fd);
+    wal_cursor_init(c);
+    return r;
+}
+
+result_t wal_cursor_seek(wal_t *w, err_t *e, wal_cursor_t *c, uint64_t seq,
+                         uint8_t *scratch, int32_t scratch_len)
+{
+    int32_t  idx;
+    result_t r;
+
+    if (!w || !c || scratch_len < WAL_REC_HEADER_SIZE) {
+        ERR_PUSH(e, ERR_INVALID);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    /*
+     * One past the end is a legal place to stand: it is where a
+     * replica that is fully caught up asks to start, and reading from
+     * there returns nothing until the log grows.
+     */
+    if (seq < wal_first_seq(w) || seq > wal_next_seq(w)) {
+        ERR_PUSH_INT(e, ERR_INVALID, (int64_t)seq);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    idx = seg_index_of(w, seq);
+    if (idx < 0) {
+        ERR_PUSH_INT(e, ERR_INVALID, (int64_t)seq);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    r = cursor_open_seg(w, e, c, w->seg_base[idx]);
+    if (!result_ok(r))
+        return r;
+    c->next_seq = w->seg_base[idx];
+
+    /* Walk the segment's headers until the wanted sequence is next. */
+    while (c->next_seq < seq) {
+        wal_rec_t rec;
+        int32_t   got = 0;
+        int32_t   size;
+
+        r = os_pread_full(e, c->fd, scratch, WAL_REC_HEADER_SIZE, c->off,
+                          &got);
+        if (!result_ok(r))
+            return r;
+        if (got < WAL_REC_HEADER_SIZE ||
+            !wal_rec_decode(scratch, got, &rec) || wal_rec_is_end(&rec)) {
+            /* The sequence is named by the table but not on disk. */
+            ERR_PUSH_INT(e, ERR_STORAGE, (int64_t)c->next_seq);
+            return RESULT_ERR(ERR_STORAGE, 0);
+        }
+
+        size = wal_rec_size((int32_t)rec.len);
+        if (size == 0 || rec.seq != c->next_seq) {
+            ERR_PUSH_INT(e, ERR_STORAGE, (int64_t)c->next_seq);
+            return RESULT_ERR(ERR_STORAGE, 0);
+        }
+
+        c->off += size;
+        c->next_seq++;
+    }
+
+    return RESULT_OK;
+}
+
+result_t wal_cursor_read(wal_t *w, err_t *e, wal_cursor_t *c,
+                         uint64_t limit_seq, uint8_t *buf, int32_t buf_len,
+                         int32_t *out_len)
+{
+    int32_t  used = 0;
+    int32_t  attempts = 0;
+
+    if (!w || !c || !buf || !out_len || c->fd < 0) {
+        ERR_PUSH(e, ERR_INVALID);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    *out_len = 0;
+    if (c->next_seq > limit_seq)
+        return RESULT_OK;
+
+    /*
+     * One read, then walk the records inside it. Two passes over the
+     * same bytes beats a syscall per record, and the walk is what
+     * finds the last whole record the caller may pass on.
+     */
+    for (attempts = 0; attempts < 2; attempts++) {
+        int32_t got = 0;
+        int32_t at = 0;
+        result_t r = os_pread_full(e, c->fd, buf, buf_len, c->off, &got);
+
+        if (!result_ok(r))
+            return r;
+
+        while (at < got) {
+            wal_rec_t rec;
+            int32_t   size;
+
+            if (!wal_rec_decode(buf + at, got - at, &rec))
+                break;                          /* not a whole header */
+            if (wal_rec_is_end(&rec))
+                break;                          /* unwritten space */
+            if (rec.seq != c->next_seq) {
+                ERR_PUSH_INT(e, ERR_STORAGE, (int64_t)c->next_seq);
+                return RESULT_ERR(ERR_STORAGE, 0);
+            }
+            if (c->next_seq > limit_seq)
+                break;
+
+            size = wal_rec_size((int32_t)rec.len);
+            if (size == 0) {
+                ERR_PUSH_INT(e, ERR_STORAGE, (int64_t)rec.len);
+                return RESULT_ERR(ERR_STORAGE, 0);
+            }
+            if (at + size > got)
+                break;                          /* record is cut off */
+
+            at += size;
+            c->next_seq++;
+        }
+
+        used = at;
+        c->off += at;
+        if (used > 0)
+            break;
+
+        /*
+         * Nothing here. Either the log ends, or this segment does and
+         * the next one starts exactly where the cursor stands. The
+         * writer rolls over on a record that does not fit, so the tail
+         * it leaves behind is unwritten space rather than a boundary
+         * the offset alone would show.
+         */
+        {
+            int32_t idx = seg_index_of(w, c->next_seq);
+            result_t rr;
+
+            if (idx < 0 || w->seg_base[idx] == c->seg_base)
+                break;
+
+            rr = cursor_open_seg(w, e, c, w->seg_base[idx]);
+            if (!result_ok(rr))
+                return rr;
+        }
+    }
+
+    *out_len = used;
+    return RESULT_OK;
+}
+
+result_t wal_append_at(wal_t *w, err_t *e, wal_rec_t *r,
+                       const uint8_t *payload, uint8_t *scratch,
+                       int32_t scratch_len)
+{
+    uint64_t want = r ? r->seq : 0;
+    result_t res;
+
+    if (!w || !r) {
+        ERR_PUSH(e, ERR_INVALID);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    /*
+     * Checked before the append rather than after, since an append
+     * that lands at the wrong sequence has already written itself into
+     * the log by the time the caller could notice.
+     */
+    if (want != wal_next_seq(w)) {
+        ERR_PUSH_INT(e, ERR_INVALID, (int64_t)want);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    res = wal_append(w, e, r, payload, scratch, scratch_len);
+    if (!result_ok(res))
+        return res;
+
+    if (r->seq != want) {
+        /* A rollover cannot renumber, so this would be a bug here. */
+        ERR_PUSH_INT(e, ERR_STORAGE, (int64_t)r->seq);
+        return RESULT_ERR(ERR_STORAGE, 0);
+    }
     return RESULT_OK;
 }
 

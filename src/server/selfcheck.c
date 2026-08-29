@@ -9,6 +9,7 @@
 #include "wal/record.h"
 #include "wal/segment.h"
 #include "wal/wal.h"
+#include "wal/index.h"
 #include "server/session.h"
 #include "sys/os.h"
 #include "io/uring.h"
@@ -121,13 +122,18 @@ int selfcheck_header(void)
         return 1;
     }
 
-    /* HELLO is inside the accepted op range, one past the old ceiling */
+    /* The session and replication verbs are inside the accepted range */
     hdr_in.op = MSG_OP_HELLO;
     if (!msg_header_valid(&hdr_in)) {
         DBG_LOG("header: HELLO rejected as out of range");
         return 1;
     }
-    hdr_in.op = MSG_OP_HELLO + 1;
+    hdr_in.op = MSG_OP_REPL_START;
+    if (!msg_header_valid(&hdr_in)) {
+        DBG_LOG("header: REPL_START rejected as out of range");
+        return 1;
+    }
+    hdr_in.op = MSG_OP_MAX + 1;
     if (msg_header_valid(&hdr_in)) {
         DBG_LOG("header: unknown op accepted");
         return 1;
@@ -1306,6 +1312,102 @@ out:
 
 /* ---- Session table ---- */
 
+/* ---- the key index ---- */
+
+static void index_feed(wal_index_t *ix, uint64_t key, uint64_t seq)
+{
+    wal_rec_t r;
+
+    mem_zero((uint8_t *)&r, (int32_t)sizeof(r));
+    r.partition_key = key;
+    r.seq = seq;
+    wal_index_add(ix, &r);
+}
+
+int selfcheck_wal_index(void)
+{
+    static wal_index_t ix;
+    uint64_t           from = 0;
+    uint64_t           last = 0;
+
+    wal_index_init(&ix);
+
+    if (wal_index_count(&ix) != 0 || !wal_index_complete(&ix)) {
+        DBG_LOG("index: an empty table is not empty");
+        return 1;
+    }
+
+    /* Two keys interleaved, so neither one's range is the log's. */
+    index_feed(&ix, 10, 1);
+    index_feed(&ix, 20, 2);
+    index_feed(&ix, 10, 3);
+    index_feed(&ix, 20, 4);
+    index_feed(&ix, 10, 5);
+
+    if (wal_index_count(&ix) != 2) {
+        DBG_LOG("index: %d keys, wanted 2", wal_index_count(&ix));
+        return 1;
+    }
+
+    if (!wal_index_range(&ix, 10, 1, &from, &last) || from != 1 || last != 5) {
+        DBG_LOG("index: key 10 spans %d..%d", (int32_t)from, (int32_t)last);
+        return 1;
+    }
+    if (!wal_index_range(&ix, 20, 1, &from, &last) || from != 2 || last != 4) {
+        DBG_LOG("index: key 20 spans %d..%d", (int32_t)from, (int32_t)last);
+        return 1;
+    }
+
+    /*
+     * Asking from before a key exists starts where it does. Asking
+     * from after is left alone, because where its next record falls is
+     * not something first-and-last can say, and moving the answer
+     * forward would skip records.
+     */
+    if (!wal_index_range(&ix, 20, 1, &from, &last) || from != 2) {
+        DBG_LOG("index: an early start was not moved forward");
+        return 1;
+    }
+    if (!wal_index_range(&ix, 20, 3, &from, &last) || from != 3) {
+        DBG_LOG("index: a later start was moved to %d", (int32_t)from);
+        return 1;
+    }
+
+    /* A key that was never written is known to be absent. */
+    if (wal_index_range(&ix, 999, 1, &from, &last)) {
+        DBG_LOG("index: a key that does not exist was found");
+        return 1;
+    }
+    if (!wal_index_complete(&ix)) {
+        DBG_LOG("index: a table with room to spare called itself short");
+        return 1;
+    }
+
+    /*
+     * Once it runs out of room it stops claiming to know what is
+     * absent, which is what keeps a reader from being told a key is
+     * not there when it is.
+     */
+    {
+        uint64_t k;
+
+        for (k = 0; k < WAL_INDEX_KEYS + 4; k++)
+            index_feed(&ix, 1000 + k, 100 + k);
+
+        if (wal_index_count(&ix) != WAL_INDEX_KEYS) {
+            DBG_LOG("index: filled to %d", wal_index_count(&ix));
+            return 1;
+        }
+        if (wal_index_complete(&ix)) {
+            DBG_LOG("index: a full table still claims to know every key");
+            return 1;
+        }
+    }
+
+    DBG_LOG("index: key ranges, and knowing what it does not know: ok");
+    return 0;
+}
+
 int selfcheck_sessions(void)
 {
     static session_table_t t;
@@ -1464,6 +1566,8 @@ int selfcheck_sessions(void)
 
 /* ---- Event loop, driven over a real loopback socket ---- */
 
+static void loop_read_forget(int32_t fd);
+
 /*
  * Connect to the loop's listener. The kernel completes the handshake
  * from the listen backlog, so this returns before the server has
@@ -1488,6 +1592,7 @@ static int32_t loop_client_connect(int32_t port)
         os_close(&e, fd);
         return -1;
     }
+    loop_read_forget(fd);
     return fd;
 }
 
@@ -1501,36 +1606,101 @@ static void loop_settle(loop_t *l, err_t *e)
 }
 
 /*
+ * Bytes read from a connection and not yet returned as a frame.
+ *
+ * Frames pipeline. A subscription sends several in one write, and a
+ * reader that keeps only the first loses the rest, so whatever arrived
+ * alongside stays here until it is asked for. Kept per connection,
+ * because the checks hold two open at once.
+ */
+#define LOOP_RD_SLOTS 4
+
+static struct {
+    int32_t fd;
+    int32_t len;
+    uint8_t buf[4096];
+} loop_rd[LOOP_RD_SLOTS];
+
+static void loop_read_forget(int32_t fd)
+{
+    int32_t i;
+
+    for (i = 0; i < LOOP_RD_SLOTS; i++) {
+        if (loop_rd[i].fd == fd) {
+            loop_rd[i].fd = -1;
+            loop_rd[i].len = 0;
+        }
+    }
+}
+
+static int32_t loop_rd_slot(int32_t fd)
+{
+    int32_t i;
+
+    for (i = 0; i < LOOP_RD_SLOTS; i++) {
+        if (loop_rd[i].fd == fd)
+            return i;
+    }
+    for (i = 0; i < LOOP_RD_SLOTS; i++) {
+        if (loop_rd[i].fd <= 0) {
+            loop_rd[i].fd = fd;
+            loop_rd[i].len = 0;
+            return i;
+        }
+    }
+
+    /*
+     * Every slot is spoken for by a connection some earlier check
+     * opened. They are used one or two at a time and closed in order,
+     * so the oldest is the one to take. Taking a live one would lose
+     * buffered bytes, which shows up as a check failing rather than as
+     * one quietly passing.
+     */
+    for (i = 1; i < LOOP_RD_SLOTS; i++)
+        loop_rd[i - 1] = loop_rd[i];
+    loop_rd[LOOP_RD_SLOTS - 1].fd = fd;
+    loop_rd[LOOP_RD_SLOTS - 1].len = 0;
+    return LOOP_RD_SLOTS - 1;
+}
+
+/*
  * Read one whole frame. The loop is not running while this blocks, so
  * everything expected must already have been sent.
  */
 static bool_t loop_read_frame(int32_t fd, uint8_t *buf, int32_t cap,
                               msg_header_t *h, int32_t *payload_len)
 {
-    int32_t got = 0;
-    int32_t total;
+    int32_t slot = loop_rd_slot(fd);
 
-    while (got < MSG_HEADER_SIZE) {
-        ssize_t n = os_read_raw(fd, buf + got, (size_t)(cap - got));
-        if (n <= 0)
-            return FALSE;
-        got += (int32_t)n;
-    }
-    if (!msg_decode_header(buf, got, h))
+    if (slot < 0)
         return FALSE;
 
-    total = MSG_HEADER_SIZE + (int32_t)h->payload_len;
-    if (total > cap)
-        return FALSE;
-    while (got < total) {
-        ssize_t n = os_read_raw(fd, buf + got, (size_t)(cap - got));
+    for (;;) {
+        int32_t have = loop_rd[slot].len;
+        ssize_t n;
+
+        if (have >= MSG_HEADER_SIZE &&
+            msg_decode_header(loop_rd[slot].buf, have, h)) {
+            int32_t total = MSG_HEADER_SIZE + (int32_t)h->payload_len;
+
+            if (total > cap)
+                return FALSE;
+            if (have >= total) {
+                mem_copy(buf, loop_rd[slot].buf, total);
+                mem_copy(loop_rd[slot].buf, loop_rd[slot].buf + total,
+                         have - total);
+                loop_rd[slot].len = have - total;
+                *payload_len = (int32_t)h->payload_len;
+                return TRUE;
+            }
+        }
+
+        n = os_read_raw(fd, loop_rd[slot].buf + have,
+                        (size_t)((int32_t)sizeof(loop_rd[slot].buf) - have));
         if (n <= 0)
             return FALSE;
-        got += (int32_t)n;
+        loop_rd[slot].len = have + (int32_t)n;
     }
-
-    *payload_len = (int32_t)h->payload_len;
-    return TRUE;
 }
 
 /* Send one framed request. */
@@ -1650,7 +1820,7 @@ int selfcheck_loop(void)
     }
 
     session_table_init(&sessions);
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
         DBG_LOG("loop: init failed (io_uring unavailable?), skipping");
         dbg_err_print(&e);
         wal_close(&w, &e);
@@ -1876,15 +2046,142 @@ int selfcheck_loop(void)
         }
     }
 
-    /* A verb that exists but is not built says so */
+    /* A read hands back what the log holds for a key, and then stops */
     {
-        msg_err_payload_t ep;
-        msg_read_t        rd;
+        msg_read_t rd;
+        int32_t    records = 0;
+        int32_t    rounds = 0;
+        bool_t     ended = FALSE;
 
         rd.min_seq = 0;
         msg_encode_read(buf, (int32_t)sizeof(buf), &rd);
         if (!loop_send_frame(fd, MSG_OP_READ, 0, 1, 0, buf, MSG_READ_SIZE)) {
             DBG_LOG("loop: read send failed");
+            goto out;
+        }
+        loop_settle(&l, &e);
+
+        if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ACK || plen != 0) {
+            DBG_LOG("loop: a read was not acknowledged");
+            goto out;
+        }
+
+        /*
+         * Records arrive a batch per pass, so the loop has to keep
+         * turning between reads. The end is an empty NOTIFY carrying
+         * LAST, which is how a read says it has shown everything
+         * rather than merely paused.
+         */
+        while (rounds++ < 64 && !ended) {
+            loop_settle(&l, &e);
+            if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen)) {
+                DBG_LOG("loop: the read stopped answering");
+                goto out;
+            }
+            if (h.op != MSG_OP_NOTIFY) {
+                DBG_LOG("loop: a read answered with op %d", (int32_t)h.op);
+                goto out;
+            }
+            if (h.flags & MSG_FLAG_LAST) {
+                ended = TRUE;
+                break;
+            }
+            if (h.partition_key != 1) {
+                DBG_LOG("loop: a read returned key %d",
+                        (int32_t)h.partition_key);
+                goto out;
+            }
+            records++;
+        }
+
+        if (!ended || records < 3) {
+            DBG_LOG("loop: the read returned %d records, ended=%d",
+                    records, (int32_t)ended);
+            goto out;
+        }
+    }
+
+    /* A subscription is told about records as they are written */
+    {
+        msg_subscribe_t sub;
+        int32_t         watcher = loop_client_connect(l.port);
+        uint64_t        wsession = 0;
+        uint64_t        whigh = 0;
+        int32_t         rounds = 0;
+        bool_t          seen = FALSE;
+
+        if (watcher < 0 ||
+            !loop_hello(watcher, &l, &e, 0, &wsession, &whigh)) {
+            DBG_LOG("loop: the watching connection could not open");
+            goto out;
+        }
+
+        sub.min_seq = 0;
+        sub.from_seq = 0;       /* live only */
+        msg_encode_subscribe(buf, (int32_t)sizeof(buf), &sub);
+        if (!loop_send_frame(watcher, MSG_OP_SUBSCRIBE, MSG_FLAG_ALL_KEYS,
+                             0, 0, buf, MSG_SUBSCRIBE_SIZE)) {
+            DBG_LOG("loop: subscribe send failed");
+            os_close(&e, watcher);
+            goto out;
+        }
+        loop_settle(&l, &e);
+        if (!loop_read_frame(watcher, buf, (int32_t)sizeof(buf), &h, &plen) ||
+            h.op != MSG_OP_ACK || plen != 0) {
+            DBG_LOG("loop: a subscription was not acknowledged");
+            os_close(&e, watcher);
+            goto out;
+        }
+
+        /*
+         * The same connection writes and watches, which is worth
+         * proving: an acknowledgement and a record arrive on it
+         * together and are told apart by their verb.
+         */
+        if (!loop_send_frame(watcher, MSG_OP_WRITE,
+                             MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC, 77, 1,
+                             (const uint8_t *)"watched", 7)) {
+            DBG_LOG("loop: write under subscription failed");
+            os_close(&e, watcher);
+            goto out;
+        }
+
+        while (rounds++ < 32 && !seen) {
+            loop_settle(&l, &e);
+            if (!loop_read_frame(watcher, buf, (int32_t)sizeof(buf), &h,
+                                 &plen)) {
+                DBG_LOG("loop: the subscription stopped answering");
+                os_close(&e, watcher);
+                goto out;
+            }
+            if (h.op == MSG_OP_ACK)
+                continue;               /* its own write, answered */
+            if (h.op != MSG_OP_NOTIFY) {
+                DBG_LOG("loop: subscription got op %d", (int32_t)h.op);
+                os_close(&e, watcher);
+                goto out;
+            }
+            if (h.partition_key == 77 && plen == 7 &&
+                mem_cmp(buf + MSG_HEADER_SIZE,
+                        (const uint8_t *)"watched", 7) == 0) {
+                seen = TRUE;
+            }
+        }
+
+        os_close(&e, watcher);
+        if (!seen) {
+            DBG_LOG("loop: the record never reached the subscriber");
+            goto out;
+        }
+    }
+
+    /* A verb that exists but is not built still says so */
+    {
+        msg_err_payload_t ep;
+
+        if (!loop_send_frame(fd, MSG_OP_DELETE, 0, 1, 0, NULL, 0)) {
+            DBG_LOG("loop: delete send failed");
             goto out;
         }
         loop_settle(&l, &e);
@@ -1982,7 +2279,9 @@ int selfcheck_loop(void)
             DBG_LOG("loop: reopen of the log failed");
             goto out_nolp;
         }
-        if (info2.last_seq != 6 || info2.records != 6 || info2.torn) {
+        /* Six writes from the first connection and one from the
+         * connection that was watching them. */
+        if (info2.last_seq != 7 || info2.records != 7 || info2.torn) {
             DBG_LOG("loop: log reopened with %d records, last %d",
                     (int32_t)info2.records, (int32_t)info2.last_seq);
             wal_close(&w2, &e);
@@ -2041,7 +2340,7 @@ int selfcheck_session_recovery(void)
         tmp_dir_destroy(dir);
         return 1;
     }
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
         DBG_LOG("session recovery: loop unavailable, skipping");
         wal_close(&w, &e);
         tmp_dir_destroy(dir);
@@ -2108,7 +2407,7 @@ int selfcheck_session_recovery(void)
         }
     }
 
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
         DBG_LOG("session recovery: second loop failed");
         wal_close(&w, &e);
         tmp_dir_destroy(dir);
@@ -2603,12 +2902,77 @@ int selfcheck_conn_framing(void)
         actions[0].u.frame.payload_len != payload_len ||
         mem_cmp(actions[0].u.frame.payload,
                 (const uint8_t *)payload_str, payload_len) != 0 ||
-        c.buf_len != 0 ||
+        c.buf_len != c.buf_off ||
         c.closed) {
         DBG_LOG("conn case1: single-frame parse failed");
         return 1;
     }
     DBG_LOG("conn case1: single-frame parse: ok");
+
+    /*
+     * Case 1b: two frames in one feed keep their own payloads.
+     *
+     * The frames point into the receive buffer, so anything that moves
+     * that buffer while the caller is still holding them puts one
+     * frame's bytes under another frame's header. That is not a
+     * hypothetical: it is what compacting inside conn_feed did, and a
+     * pipelining client had its records stored carrying each other's
+     * payloads. Nothing above this layer can notice, because every
+     * frame is well formed and the count is right.
+     */
+    conn_init(&c, conn_buf, (int32_t)sizeof(conn_buf), CONN_MODE_INTERNAL);
+    {
+        const char first[] = "first";
+        const char second[] = "second-and-longer";
+        int32_t    at = 0;
+        int32_t    l1 = (int32_t)sizeof(first) - 1;
+        int32_t    l2 = (int32_t)sizeof(second) - 1;
+
+        h = msg_header_new(MSG_OP_WRITE, MSG_RECORD_NONE, MSG_FLAG_ACK_REQ,
+                           (uint32_t)l1, 0, 1);
+        msg_encode_header(wire + at, (int32_t)sizeof(wire) - at, &h);
+        mem_copy(wire + at + MSG_HEADER_SIZE, (const uint8_t *)first, l1);
+        at += MSG_HEADER_SIZE + l1;
+
+        h = msg_header_new(MSG_OP_WRITE, MSG_RECORD_NONE, MSG_FLAG_ACK_REQ,
+                           (uint32_t)l2, 0, 2);
+        msg_encode_header(wire + at, (int32_t)sizeof(wire) - at, &h);
+        mem_copy(wire + at + MSG_HEADER_SIZE, (const uint8_t *)second, l2);
+        at += MSG_HEADER_SIZE + l2;
+
+        /*
+         * A third frame, incomplete, and long enough that moving it
+         * to the front would land on top of the first two rather than
+         * stopping short of them.
+         */
+        h = msg_header_new(MSG_OP_WRITE, MSG_RECORD_NONE, MSG_FLAG_ACK_REQ,
+                           1024, 0, 3);
+        msg_encode_header(wire + at, (int32_t)sizeof(wire) - at, &h);
+        at += MSG_HEADER_SIZE;
+        mem_set(wire + at, 0x5A, 256);
+        at += 256;
+
+        conn_recv_append(&c, wire, at);
+        n = conn_feed(&c, actions, 4);
+        if (n != 2 ||
+            actions[0].u.frame.payload_len != l1 ||
+            actions[1].u.frame.payload_len != l2 ||
+            mem_cmp(actions[0].u.frame.payload,
+                    (const uint8_t *)first, l1) != 0 ||
+            mem_cmp(actions[1].u.frame.payload,
+                    (const uint8_t *)second, l2) != 0) {
+            DBG_LOG("conn case1b: batched frames lost their payloads");
+            return 1;
+        }
+
+        /* And the partial third frame survives the reclaim. */
+        conn_compact(&c);
+        if (c.buf_len != MSG_HEADER_SIZE + 256 || c.buf_off != 0) {
+            DBG_LOG("conn case1b: the partial frame was not kept");
+            return 1;
+        }
+    }
+    DBG_LOG("conn case1b: batched frames keep their own payloads: ok");
 
     /* Case 2: byte-at-a-time feed of the same wire */
     conn_init(&c, conn_buf, (int32_t)sizeof(conn_buf), CONN_MODE_INTERNAL);
@@ -2625,7 +2989,7 @@ int selfcheck_conn_framing(void)
     if (n != 1 ||
         actions[0].type != CONN_ACTION_FRAME ||
         actions[0].u.frame.payload_len != payload_len ||
-        c.buf_len != 0 ||
+        c.buf_len != c.buf_off ||
         c.closed) {
         DBG_LOG("conn case2: byte-at-a-time parse failed");
         return 1;
@@ -2752,7 +3116,7 @@ int selfcheck_conn_session(void)
         actions[1].type != CONN_ACTION_FRAME ||
         actions[1].u.frame.header.op != MSG_OP_WRITE ||
         actions[1].u.frame.header.partition_key != 0xBEEF ||
-        !c.hello_seen ||
+        !c.opened ||
         c.closed) {
         DBG_LOG("session case2: hello+write failed (n=%d)", n);
         return 1;
@@ -2782,7 +3146,7 @@ int selfcheck_conn_session(void)
     for (i = 0; i < hello_len - 1; i++) {
         conn_recv_append(&c, wire + i, 1);
         n = conn_feed(&c, actions, 4);
-        if (n != 0 || c.hello_seen || c.closed) {
+        if (n != 0 || c.opened || c.closed) {
             DBG_LOG("session case4: partial hello opened session at %d", i);
             return 1;
         }
@@ -2792,7 +3156,7 @@ int selfcheck_conn_session(void)
     if (n != 1 ||
         actions[0].type != CONN_ACTION_FRAME ||
         actions[0].u.frame.header.op != MSG_OP_HELLO ||
-        !c.hello_seen ||
+        !c.opened ||
         c.closed) {
         DBG_LOG("session case4: completed hello not accepted (n=%d)", n);
         return 1;
@@ -2957,6 +3321,460 @@ int selfcheck_err(err_t *e)
     return 0;
 }
 
+
+/* ---- A failed send, and the slot it must not strand ---- */
+
+/*
+ * The completion is injected rather than provoked. The bug this
+ * guards against needed a send to fail while bytes were staged, and
+ * arranging that through real sockets is a race: it took the S2 kill
+ * test three failures across a day to hit it. loop_send_done is the
+ * seam, and everything here asserts on the loop's own state, never on
+ * frames read back, so a wrong assumption fails instead of hanging.
+ */
+int selfcheck_send_failure(void)
+{
+    static uint8_t  scratch[8192];
+    static uint8_t  staged[64];
+    static char     dir[64];
+    err_t           e;
+    wal_t           w;
+    wal_open_t      info;
+    loop_t          l;
+    session_table_t sessions;
+    int32_t         fd = -1;
+    int32_t         fd2 = -1;
+    int32_t         rc = 1;
+    int32_t         i;
+
+    err_init(&e);
+    seg_tmp_path(dir, 11);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("send failure: mkdir failed");
+        return 1;
+    }
+    session_table_init(&sessions);
+    if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
+        DBG_LOG("send failure: wal open failed");
+        tmp_dir_destroy(dir);
+        return 1;
+    }
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
+        DBG_LOG("send failure: loop unavailable, skipping");
+        wal_close(&w, &e);
+        tmp_dir_destroy(dir);
+        return 0;
+    }
+
+    /*
+     * A short write has to compact the buffer the slot actually sends
+     * from. A replica's is its own rather than the one its slot number
+     * indexes, and the old handler compacted the latter, moving memory
+     * that belonged to someone else and leaving its own untouched.
+     */
+    {
+        loop_conn_t *c = &l.conns[1];
+
+        c->in_use = TRUE;
+        c->fd = -1;
+        c->replica = 1;
+        c->send_buf = staged;
+        c->send_cap = (int32_t)sizeof(staged);
+        mem_copy(staged, (const uint8_t *)"ABCDEF", 6);
+        c->send_len = 6;
+        c->send_pending = TRUE;
+
+        loop_send_done(&l, 1, 2);
+
+        if (c->send_len != 4 ||
+            mem_cmp(staged, (const uint8_t *)"CDEF", 4) != 0) {
+            DBG_LOG("send failure: a short write compacted the wrong buffer");
+            goto out;
+        }
+
+        /* Put the fabricated slot back before the loop walks it. */
+        c->in_use = FALSE;
+        c->replica = -1;
+        c->send_len = 0;
+        c->send_pending = FALSE;
+    }
+
+    /*
+     * Now the strand. A real connection is accepted and then dressed
+     * as an attached replica with a stream staged for it.
+     */
+    fd = loop_client_connect(l.port);
+    if (fd < 0) {
+        DBG_LOG("send failure: connect failed");
+        goto out;
+    }
+    loop_settle(&l, &e);
+    if (l.accepted != 1 || !l.conns[0].in_use) {
+        DBG_LOG("send failure: the connection was not accepted");
+        goto out;
+    }
+
+    {
+        loop_conn_t *c = &l.conns[0];
+
+        c->replica = 0;
+        l.peer_live[0] = TRUE;
+        c->send_buf = staged;
+        c->send_cap = (int32_t)sizeof(staged);
+        mem_copy(staged, (const uint8_t *)"doomed", 6);
+        c->send_len = 6;
+        c->send_pending = TRUE;
+    }
+
+    /*
+     * Shut the leader's own descriptor for writing, so that if the
+     * handler wrongly keeps the staged bytes and resubmits them, the
+     * resubmission fails with EPIPE every time. Closing the peer was
+     * tried first and is not enough: the first resend can land in the
+     * dying socket before the reset is processed, succeed, and hide
+     * the leak, which is the same nondeterminism that kept this bug
+     * alive for a day. Shutting our own end asks nothing of timing.
+     */
+    os_shutdown(&e, l.conns[0].fd, SHUT_RDWR);
+    os_close(&e, fd);
+    fd = -1;
+
+    loop_send_done(&l, 0, -ECONNRESET);
+
+    for (i = 0; i < 32; i++) {
+        loop_tick(&l, &e, FALSE);
+        if (!l.conns[0].in_use)
+            break;
+    }
+    if (l.conns[0].in_use || l.peer_live[0]) {
+        DBG_LOG("send failure: a failed send stranded the replica slot");
+        goto out;
+    }
+
+    /* And the freed slot can be taken by the node coming back. */
+    fd2 = loop_client_connect(l.port);
+    if (fd2 < 0) {
+        DBG_LOG("send failure: the second connect failed");
+        goto out;
+    }
+    loop_settle(&l, &e);
+    if (!loop_send_frame(fd2, MSG_OP_REPL_START, 0, 0, 1, NULL, 0)) {
+        DBG_LOG("send failure: repl_start send failed");
+        goto out;
+    }
+    for (i = 0; i < 32 && !l.peer_live[0]; i++)
+        loop_tick(&l, &e, FALSE);
+    if (!l.peer_live[0]) {
+        DBG_LOG("send failure: the freed slot could not be taken again");
+        goto out;
+    }
+
+    DBG_LOG("send failure: the slot is freed and taken again: ok");
+    rc = 0;
+
+out:
+    if (fd >= 0)
+        os_close(&e, fd);
+    if (fd2 >= 0)
+        os_close(&e, fd2);
+    loop_shutdown(&l);
+    wal_close(&w, &e);
+    tmp_dir_destroy(dir);
+    return rc;
+}
+
+/* ---- Replication, two nodes in one process ---- */
+
+/*
+ * Both loops are driven by hand, a pass each, turn by turn. Real nodes
+ * block in their own ring and neither waits for the other, but the
+ * order of what has to happen between them is the same, and taking
+ * turns is what makes a two-node check possible in one thread.
+ */
+static void repl_settle(loop_t *a, loop_t *b, err_t *e, int32_t rounds)
+{
+    int32_t i;
+
+    for (i = 0; i < rounds; i++) {
+        loop_tick(a, e, FALSE);
+        loop_tick(b, e, FALSE);
+    }
+}
+
+/*
+ * Turn both loops over until the replica is attached, or has gone.
+ * Bounded rather than timed: what is being waited for is a completion
+ * the kernel has already been told about, and a fixed number of passes
+ * would be either too few on a loaded machine or wasted on an idle
+ * one.
+ */
+static bool_t repl_wait_attached(loop_t *a, loop_t *b, err_t *e, bool_t want)
+{
+    int32_t i;
+
+    for (i = 0; i < 2000; i++) {
+        if ((a->peer_live[0] ? TRUE : FALSE) == want)
+            return TRUE;
+        loop_tick(a, e, FALSE);
+        loop_tick(b, e, FALSE);
+    }
+    return FALSE;
+}
+
+/* Turn both loops over until the replica holds what the leader does. */
+static bool_t repl_wait_caught_up(loop_t *a, loop_t *b, err_t *e,
+                                  const wal_t *lw, const wal_t *fw)
+{
+    int32_t i;
+
+    for (i = 0; i < 2000; i++) {
+        if (wal_durable_seq(fw) == wal_durable_seq(lw))
+            return TRUE;
+        loop_tick(a, e, FALSE);
+        loop_tick(b, e, FALSE);
+    }
+    return FALSE;
+}
+
+static bool_t repl_write(int32_t fd, uint64_t client_seq, uint16_t flags)
+{
+    return loop_send_frame(fd, MSG_OP_WRITE, flags, 7, client_seq,
+                           (const uint8_t *)"record", 6);
+}
+
+int selfcheck_replication(void)
+{
+    static uint8_t  scratch[8192];
+    static uint8_t  buf[512];
+    static char     ldir[64];
+    static char     fdir[64];
+    static const char leader_text[] = "127.0.0.1:1";
+    err_t           e;
+    wal_t           lw;
+    wal_t           fw;
+    wal_open_t      info;
+    loop_t          leader;
+    loop_t          follower;
+    session_table_t lsessions;
+    session_table_t fsessions;
+    sockaddr_in_t   addr;
+    msg_header_t    h;
+    int32_t         plen = 0;
+    int32_t         fd = -1;
+    int32_t         ffd = -1;
+    uint64_t        session = 0;
+    uint64_t        high = 0;
+    int32_t         rc = 1;
+    bool_t          follower_up = FALSE;
+
+    err_init(&e);
+    seg_tmp_path(ldir, 9);
+    seg_tmp_path(fdir, 10);
+    if (!result_ok(os_mkdir(&e, ldir, MODE_0700)) ||
+        !result_ok(os_mkdir(&e, fdir, MODE_0700))) {
+        DBG_LOG("replication: mkdir failed");
+        return 1;
+    }
+
+    session_table_init(&lsessions);
+    session_table_init(&fsessions);
+
+    if (!result_ok(wal_open(&lw, &e, ldir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &lsessions)) ||
+        !result_ok(wal_open(&fw, &e, fdir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &fsessions))) {
+        DBG_LOG("replication: wal open failed");
+        goto out_dirs;
+    }
+
+    if (!result_ok(loop_init(&leader, &e, &lw, &lsessions, 0x7F000001, 0, 64))) {
+        DBG_LOG("replication: loop unavailable, skipping");
+        rc = 0;
+        goto out_wal;
+    }
+    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001, 0, 64))) {
+        DBG_LOG("replication: second loop failed");
+        loop_shutdown(&leader);
+        goto out_wal;
+    }
+    follower_up = TRUE;
+
+    mem_zero((uint8_t *)&addr, (int32_t)sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)leader.port);
+    addr.sin_addr = htonl(0x7F000001);
+
+    if (!result_ok(loop_set_leader(&follower, &e, &addr, leader_text))) {
+        DBG_LOG("replication: the follower could not take a timer");
+        goto out_loops;
+    }
+
+    if (!repl_wait_attached(&leader, &follower, &e, TRUE)) {
+        DBG_LOG("replication: the replica did not attach");
+        goto out_loops;
+    }
+
+    /* A replicated write is answered only once the replica holds it. */
+    fd = loop_client_connect(leader.port);
+    if (fd < 0 || !loop_hello(fd, &leader, &e, 0, &session, &high)) {
+        DBG_LOG("replication: client hello failed");
+        goto out_loops;
+    }
+    if (!repl_write(fd, 1, MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC |
+                    MSG_FLAG_REPLICATED)) {
+        DBG_LOG("replication: write failed");
+        goto out_loops;
+    }
+    if (!repl_wait_caught_up(&leader, &follower, &e, &lw, &fw)) {
+        DBG_LOG("replication: the replica did not take the record");
+        goto out_loops;
+    }
+    repl_settle(&leader, &follower, &e, 8);
+
+    if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen)) {
+        DBG_LOG("replication: no answer to a replicated write");
+        goto out_loops;
+    }
+    if (h.op != MSG_OP_ACK || !(h.flags & MSG_FLAG_REPLICATED)) {
+        DBG_LOG("replication: answered with op %d flags %d",
+                (int32_t)h.op, (int32_t)h.flags);
+        goto out_loops;
+    }
+    if (h.flags & MSG_FLAG_DEGRADED) {
+        DBG_LOG("replication: acknowledged as degraded with a replica up");
+        goto out_loops;
+    }
+    /* A write to the replica is sent to the leader by address. */
+    ffd = loop_client_connect(follower.port);
+    if (ffd < 0 || !loop_hello(ffd, &follower, &e, 0, &session, &high)) {
+        DBG_LOG("replication: hello to the replica failed");
+        goto out_loops;
+    }
+    if (!repl_write(ffd, 1, MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC)) {
+        DBG_LOG("replication: write to the replica failed to send");
+        goto out_loops;
+    }
+    repl_settle(&leader, &follower, &e, 16);
+    if (!loop_read_frame(ffd, buf, (int32_t)sizeof(buf), &h, &plen)) {
+        DBG_LOG("replication: the replica did not answer a write");
+        goto out_loops;
+    }
+    {
+        msg_err_payload_t ep;
+        const uint8_t    *text;
+
+        if (h.op != MSG_OP_ERR ||
+            !msg_decode_err(buf + MSG_HEADER_SIZE, plen, &ep) ||
+            ep.code != MSG_ERR_NOT_LEADER) {
+            DBG_LOG("replication: a write to the replica was not refused");
+            goto out_loops;
+        }
+        text = msg_err_text(buf + MSG_HEADER_SIZE, plen);
+        if (!text || ep.text_len != (uint16_t)(sizeof(leader_text) - 1) ||
+            mem_cmp(text, (const uint8_t *)leader_text,
+                    (int32_t)ep.text_len) != 0) {
+            DBG_LOG("replication: the refusal did not name the leader");
+            goto out_loops;
+        }
+    }
+    os_close(&e, ffd);
+    ffd = -1;
+
+    /*
+     * With the replica gone the same write is refused at once. There
+     * is nothing left that could confirm it, so waiting out the
+     * deadline would only delay the same answer.
+     */
+    loop_shutdown(&follower);
+    follower_up = FALSE;
+
+    if (!repl_wait_attached(&leader, &leader, &e, FALSE)) {
+        DBG_LOG("replication: the leader still counts a replica that left");
+        goto out_loops;
+    }
+    if (!repl_write(fd, 2, MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC |
+                    MSG_FLAG_REPLICATED)) {
+        DBG_LOG("replication: second write failed");
+        goto out_loops;
+    }
+    repl_settle(&leader, &leader, &e, 16);
+    if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen)) {
+        DBG_LOG("replication: no answer with the replica gone");
+        goto out_loops;
+    }
+    {
+        msg_err_payload_t ep;
+
+        if (h.op != MSG_OP_ERR ||
+            !msg_decode_err(buf + MSG_HEADER_SIZE, plen, &ep) ||
+            ep.code != MSG_ERR_NO_REPLICAS) {
+            DBG_LOG("replication: a write with no replica was not refused");
+            goto out_loops;
+        }
+    }
+
+    /*
+     * The same write, taken because the client said it would accept
+     * one copy, and told that it got one.
+     */
+    if (!repl_write(fd, 3, MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC |
+                    MSG_FLAG_REPLICATED | MSG_FLAG_ALLOW_DEGRADED)) {
+        DBG_LOG("replication: degraded write failed");
+        goto out_loops;
+    }
+    repl_settle(&leader, &leader, &e, 16);
+    if (!loop_read_frame(fd, buf, (int32_t)sizeof(buf), &h, &plen) ||
+        h.op != MSG_OP_ACK || !(h.flags & MSG_FLAG_DEGRADED)) {
+        DBG_LOG("replication: a leader-only copy did not say so");
+        goto out_loops;
+    }
+
+    /*
+     * A replica that comes back asks from the sequence it holds and is
+     * sent what it missed. That is the path a restart takes, and the
+     * only one that reads the log rather than the batch in hand.
+     */
+    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001, 0, 64))) {
+        DBG_LOG("replication: the replica could not start again");
+        goto out_loops;
+    }
+    follower_up = TRUE;
+    if (!result_ok(loop_set_leader(&follower, &e, &addr, leader_text))) {
+        DBG_LOG("replication: the replica could not take a timer again");
+        goto out_loops;
+    }
+    if (!repl_wait_attached(&leader, &follower, &e, TRUE) ||
+        !repl_wait_caught_up(&leader, &follower, &e, &lw, &fw)) {
+        DBG_LOG("replication: after coming back the replica is at %d, "
+                "the leader at %d", (int32_t)wal_durable_seq(&fw),
+                (int32_t)wal_durable_seq(&lw));
+        goto out_loops;
+    }
+
+    DBG_LOG("replication: stream, quorum ack, refusal and catch-up: ok");
+    rc = 0;
+
+out_loops:
+    if (fd >= 0)
+        os_close(&e, fd);
+    if (ffd >= 0)
+        os_close(&e, ffd);
+    if (follower_up)
+        loop_shutdown(&follower);
+    loop_shutdown(&leader);
+out_wal:
+    wal_close(&lw, &e);
+    wal_close(&fw, &e);
+out_dirs:
+    tmp_dir_destroy(ldir);
+    tmp_dir_destroy(fdir);
+    return rc;
+}
+
 int selfcheck_run(arena_t *a, err_t *e)
 {
     if (selfcheck_arena(a))
@@ -2973,6 +3791,8 @@ int selfcheck_run(arena_t *a, err_t *e)
         return 1;
     if (selfcheck_wal())
         return 1;
+    if (selfcheck_wal_index())
+        return 1;
     if (selfcheck_conn_framing())
         return 1;
     if (selfcheck_conn_session())
@@ -2984,6 +3804,10 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_loop())
         return 1;
     if (selfcheck_session_recovery())
+        return 1;
+    if (selfcheck_send_failure())
+        return 1;
+    if (selfcheck_replication())
         return 1;
     if (selfcheck_err(e))
         return 1;
