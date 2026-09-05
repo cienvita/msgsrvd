@@ -19,8 +19,8 @@
  * other keys, and it cannot be a fixed size: it grows with the log.
  * So a key whose records are spread evenly through the log still costs
  * a full walk, and the fix for that is not a bigger index, it is
- * separate storage per key. See docs/streams.md for what that would
- * cost.
+ * separate storage per key. That costs a flush per key per batch
+ * rather than one per batch, so it is not worth it yet.
  *
  * Sparse waypoints between first and last were tried and removed. A
  * waypoint is a place a record happens to be, not a boundary, so a

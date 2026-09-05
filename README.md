@@ -32,9 +32,10 @@ The key is a label and a filter, not a namespace. There is no registry
 and there are no names, and every key shares one log, one sequence,
 one flush and one replication stream. What the log does keep per key
 is where it starts and where it ends, which is what stops a read for
-one key walking the whole log. `docs/streams.md` covers what it would
-take for a key to be a unit of storage instead, and what that would
-cost.
+one key walking the whole log. Making a key a unit of storage instead
+was costed and rejected: it would trade one flush per batch for one
+per key written to, and keeping slow flushes off the acknowledgement
+path is the reason the leader sits where it does.
 
 Records are around 8 KB at most. The protocol allows 1 MiB but a
 connection's receive buffer is 8 KiB, and the design's advice is that
