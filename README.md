@@ -60,7 +60,7 @@ leader takes every write.
 ## Implementation
 
 C99, Linux x86-64 only. Raw syscalls via inline asm instead of libc
-wrappers; io_uring for all I/O. Kernel ABI structs declared locally,
+wrappers; epoll for all I/O. Kernel ABI structs declared locally,
 no kernel-header dependency. The only libc reference in code is
 `printf`, gated behind the debug build.
 
@@ -139,7 +139,7 @@ Its tests run a real server, so build one first:
 
 Durable on the node that takes the write, and on a replica when the
 write asks for one. The wire protocol, WAL, crash recovery, segment
-rollover, and an io_uring event loop with group commit all work end to
+rollover, and an epoll event loop with group commit all work end to
 end: a write is acknowledged only after the flush that covers it, and
 survives a restart.
 
