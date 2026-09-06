@@ -44,9 +44,21 @@
 #define SOCK_CLOEXEC  0x80000
 #define SOL_SOCKET  1
 #define SO_REUSEADDR 2
+#define SO_ERROR    4
 #define SO_REUSEPORT 15
 #define IPPROTO_TCP 6
 #define TCP_NODELAY 1
+
+/*
+ * send() and recv() flags.
+ *
+ * MSG_NOSIGNAL is not optional on a send. Without it a send to a peer
+ * that has gone raises SIGPIPE, and the daemon blocks no signal it
+ * does not read through a descriptor, so the default action ends the
+ * process the first time a client disappears with a reply in flight.
+ */
+#define MSG_DONTWAIT 0x40
+#define MSG_NOSIGNAL 0x4000
 
 /* shutdown() directions */
 #define SHUT_RD     0
@@ -65,13 +77,14 @@
 #define EPIPE       32
 #define ECONNRESET  104
 #define ETIMEDOUT   110
+#define EINPROGRESS 115
 
 /*
  * Signals. Delivered through a file descriptor rather than a handler:
  * a handler in a program with no libc needs its own restorer
- * trampoline, and a descriptor drops into the same ring as everything
- * else instead of interrupting it. The signals have to be blocked
- * first, or the default action still fires.
+ * trampoline, and a descriptor is watched alongside everything else
+ * instead of interrupting it. The signals have to be blocked first, or
+ * the default action still fires.
  */
 #define SIGINT      2
 #define SIGTERM     15
@@ -79,7 +92,8 @@
 #define SIG_BLOCK   0
 #define SIGSET_SIZE 8               /* bytes of sigset the kernel expects */
 
-#define SFD_CLOEXEC 0x80000
+#define SFD_CLOEXEC  0x80000
+#define SFD_NONBLOCK 0x800
 
 /* One signalfd read returns this many bytes of siginfo. */
 #define SIGNALFD_SIGINFO_SIZE 128
@@ -92,8 +106,8 @@
 #define EFD_CLOEXEC  0x80000
 
 /*
- * Timers, also delivered through a descriptor so they land in the ring
- * with everything else.
+ * Timers, also delivered through a descriptor so they are watched
+ * alongside everything else.
  *
  * The loop needs one only where something has to happen without a
  * client or a peer causing it: a replica that has to be dialled again
@@ -104,9 +118,43 @@
  */
 #define CLOCK_MONOTONIC 1
 #define TFD_CLOEXEC     0x80000
+#define TFD_NONBLOCK    0x800
 
 /* One timerfd read returns a u64 count of expirations. */
 #define TIMERFD_READ_SIZE 8
+
+/*
+ * epoll, the loop's readiness multiplexer.
+ *
+ * Level-triggered throughout, which is why no edge-trigger flag is
+ * here: the loop does one operation per readiness report rather than
+ * draining to EAGAIN, and level triggering is what makes the rest of
+ * the data show up again on the next pass.
+ */
+#define EPOLL_CLOEXEC   0x80000
+
+#define EPOLL_CTL_ADD   1
+#define EPOLL_CTL_DEL   2
+#define EPOLL_CTL_MOD   3
+
+#define EPOLLIN         0x001
+#define EPOLLOUT        0x004
+#define EPOLLERR        0x008
+#define EPOLLHUP        0x010
+
+/*
+ * The kernel's epoll_event, which on x86-64 is packed: 12 bytes, not
+ * the 16 the compiler would choose on its own. Getting this wrong is
+ * silent, because the kernel fills an array of its own stride and
+ * every entry after the first lands somewhere the reader is not
+ * looking.
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t    events;
+    uint64_t    data;
+} epoll_event_t;
+
+STATIC_ASSERT(sizeof(epoll_event_t) == 12, epoll_event_size);
 
 typedef struct {
     int64_t tv_sec;

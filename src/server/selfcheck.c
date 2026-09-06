@@ -3181,6 +3181,186 @@ int selfcheck_conn_session(void)
     return 0;
 }
 
+/* ---- epoll, the loop's multiplexer ---- */
+
+/*
+ * A connected pair on loopback. The checks below need two ends of
+ * something: one to watch, one to write into. accept4 is exercised
+ * here as well, being the only other call the loop gains that the
+ * server did not already make.
+ */
+static bool_t epoll_pair(int32_t *a_out, int32_t *b_out)
+{
+    err_t         e;
+    sockaddr_in_t addr;
+    int32_t       ln = -1;
+    int32_t       a = -1;
+    int32_t       b = -1;
+
+    err_init(&e);
+    *a_out = -1;
+    *b_out = -1;
+
+    if (!result_ok(os_socket(&e, AF_INET, SOCK_STREAM, 0, &ln)))
+        return FALSE;
+
+    mem_zero((uint8_t *)&addr, (int32_t)sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr = htonl(0x7F000001);
+
+    if (!result_ok(os_bind(&e, ln, &addr)) ||
+        !result_ok(os_listen(&e, ln, 4)) ||
+        !result_ok(os_getsockname(&e, ln, &addr))) {
+        os_close(&e, ln);
+        return FALSE;
+    }
+
+    if (!result_ok(os_socket(&e, AF_INET, SOCK_STREAM, 0, &a))) {
+        os_close(&e, ln);
+        return FALSE;
+    }
+
+    /*
+     * Blocking connect, which loopback completes out of the listen
+     * backlog without anyone accepting, so one thread is enough.
+     */
+    if (!result_ok(os_connect(&e, a, &addr)) ||
+        !result_ok(os_accept4(&e, ln, SOCK_NONBLOCK | SOCK_CLOEXEC, &b))) {
+        os_close(&e, a);
+        os_close(&e, ln);
+        return FALSE;
+    }
+
+    os_close(&e, ln);
+    *a_out = a;
+    *b_out = b;
+    return TRUE;
+}
+
+/*
+ * Readiness reported once, for the right descriptor, and stopped when
+ * the interest is dropped.
+ *
+ * The data word is deliberately wide and lopsided. The loop packs an
+ * operation into the top byte and a slot index into the low bits, and
+ * epoll_event is packed on x86-64: a struct the compiler padded to 16
+ * bytes would still return the first event intact and put every one
+ * after it in the wrong place, which is why two are asked for at once
+ * below.
+ */
+int selfcheck_epoll(void)
+{
+    static epoll_event_t evs[8];
+    const uint64_t       data_b = 0x0700000000000002ULL;
+    const uint64_t       data_a = 0x0300000000000001ULL;
+    err_t                e;
+    int32_t              ep = -1;
+    int32_t              a = -1;
+    int32_t              b = -1;
+    int32_t              n = 0;
+    int32_t              res = 0;
+    int32_t              rc = 1;
+    uint8_t              byte = 0x5A;
+
+    err_init(&e);
+    if (!result_ok(os_epoll_create(&e, EPOLL_CLOEXEC, &ep))) {
+        DBG_LOG("epoll: epoll_create1 failed");
+        return 1;
+    }
+    if (!epoll_pair(&a, &b)) {
+        DBG_LOG("epoll: could not make a loopback pair");
+        os_close(&e, ep);
+        return 1;
+    }
+
+    if (!result_ok(os_epoll_ctl(&e, ep, EPOLL_CTL_ADD, b, EPOLLIN, data_b))) {
+        DBG_LOG("epoll: add failed");
+        goto out;
+    }
+
+    /* Nothing has been written, so nothing is ready. */
+    if (!result_ok(os_epoll_wait(&e, ep, evs, 8, 0, &n)) || n != 0) {
+        DBG_LOG("epoll: an idle descriptor reported %d events", n);
+        goto out;
+    }
+
+    os_send(a, &byte, 1, MSG_NOSIGNAL | MSG_DONTWAIT, &res);
+    if (res != 1) {
+        DBG_LOG("epoll: the write to the other end moved %d bytes", res);
+        goto out;
+    }
+
+    if (!result_ok(os_epoll_wait(&e, ep, evs, 8, 0, &n)) || n != 1) {
+        DBG_LOG("epoll: a readable descriptor reported %d events", n);
+        goto out;
+    }
+    if (evs[0].data != data_b || (evs[0].events & EPOLLIN) == 0) {
+        DBG_LOG("epoll: event carried data %d, events %d",
+                (int32_t)evs[0].data, (int32_t)evs[0].events);
+        goto out;
+    }
+
+    byte = 0;
+    os_recv(b, &byte, 1, MSG_DONTWAIT, &res);
+    if (res != 1 || byte != 0x5A) {
+        DBG_LOG("epoll: the byte read back was %d bytes, value %d", res,
+                (int32_t)byte);
+        goto out;
+    }
+
+    /* Consumed, so level triggering has nothing left to report. */
+    if (!result_ok(os_epoll_wait(&e, ep, evs, 8, 0, &n)) || n != 0) {
+        DBG_LOG("epoll: a drained descriptor still reported %d events", n);
+        goto out;
+    }
+
+    /*
+     * Both ends watched for writability at once. Two events in one
+     * array is what catches a struct whose stride does not match the
+     * kernel's: the first entry would still be right and the second
+     * would be read out of the middle of it.
+     */
+    if (!result_ok(os_epoll_ctl(&e, ep, EPOLL_CTL_MOD, b, EPOLLOUT,
+                                data_b)) ||
+        !result_ok(os_epoll_ctl(&e, ep, EPOLL_CTL_ADD, a, EPOLLOUT,
+                                data_a))) {
+        DBG_LOG("epoll: modifying interest failed");
+        goto out;
+    }
+    if (!result_ok(os_epoll_wait(&e, ep, evs, 8, 0, &n)) || n != 2) {
+        DBG_LOG("epoll: two writable descriptors reported %d events", n);
+        goto out;
+    }
+    if ((evs[0].data ^ evs[1].data) != (data_a ^ data_b) ||
+        evs[0].data == evs[1].data ||
+        (evs[0].events & EPOLLOUT) == 0 ||
+        (evs[1].events & EPOLLOUT) == 0) {
+        DBG_LOG("epoll: the second event did not survive the array");
+        goto out;
+    }
+
+    /* Dropped interest is reported as nothing, not as the old interest. */
+    if (!result_ok(os_epoll_ctl(&e, ep, EPOLL_CTL_DEL, b, 0, 0)) ||
+        !result_ok(os_epoll_ctl(&e, ep, EPOLL_CTL_DEL, a, 0, 0))) {
+        DBG_LOG("epoll: delete failed");
+        goto out;
+    }
+    if (!result_ok(os_epoll_wait(&e, ep, evs, 8, 0, &n)) || n != 0) {
+        DBG_LOG("epoll: a deleted descriptor reported %d events", n);
+        goto out;
+    }
+
+    DBG_LOG("epoll: readiness reported once, for the right fd: ok");
+    rc = 0;
+
+out:
+    os_close(&e, a);
+    os_close(&e, b);
+    os_close(&e, ep);
+    return rc;
+}
+
 /*
  * Completion bookkeeping for the ring check. uring_reap takes a bare
  * function pointer with no context, so the callback reports through
@@ -3796,6 +3976,8 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_conn_framing())
         return 1;
     if (selfcheck_conn_session())
+        return 1;
+    if (selfcheck_epoll())
         return 1;
     if (selfcheck_uring())
         return 1;

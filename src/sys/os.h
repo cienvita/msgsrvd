@@ -334,6 +334,130 @@ static inline result_t os_setsockopt(err_t *e, int32_t fd, int32_t level,
     return RESULT_OK;
 }
 
+/*
+ * One int-valued socket option. SO_ERROR is the only caller: it is how
+ * a connect that was left in progress reports whether it landed, and
+ * reading it clears the pending error on the socket.
+ */
+static inline result_t os_getsockopt_int(err_t *e, int32_t fd, int32_t level,
+                                         int32_t optname, int32_t *val_out)
+{
+    int32_t len = (int32_t)sizeof(int32_t);
+    long    r;
+
+    *val_out = 0;
+    r = sys_call5(SYS_getsockopt, (long)fd, (long)level, (long)optname,
+                  (long)val_out, (long)&len);
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
+/*
+ * Accept one connection, with the flags applied to the new descriptor
+ * rather than set afterwards. SOCK_NONBLOCK is the one that matters: a
+ * blocking connection socket would stall the whole loop, and every
+ * other client's flush with it, the first time a readiness report
+ * turned out to be spurious.
+ */
+static inline result_t os_accept4(err_t *e, int32_t fd, int32_t flags,
+                                  int32_t *fd_out)
+{
+    long r = sys_call4(SYS_accept4, (long)fd, 0, 0, (long)flags);
+
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *fd_out = (int32_t)r;
+    return RESULT_OK;
+}
+
+/* ---- Socket send and receive ---- */
+
+/*
+ * These two hand back the kernel's own answer, bytes moved or a
+ * negative errno, because that is what the loop's handlers take. An
+ * err_t would be the wrong shape for them: EAGAIN after a readiness
+ * report is ordinary and would fill the error stack with frames that
+ * mean nothing, while a real failure is already carried in the number
+ * and acted on where it arrives.
+ */
+static inline void os_recv(int32_t fd, uint8_t *buf, int32_t len,
+                           int32_t flags, int32_t *res_out)
+{
+    *res_out = (int32_t)sys_call6(SYS_recvfrom, (long)fd, (long)buf,
+                                  (long)len, (long)flags, 0, 0);
+}
+
+static inline void os_send(int32_t fd, const uint8_t *buf, int32_t len,
+                           int32_t flags, int32_t *res_out)
+{
+    *res_out = (int32_t)sys_call6(SYS_sendto, (long)fd, (long)buf,
+                                  (long)len, (long)flags, 0, 0);
+}
+
+/* ---- epoll ---- */
+
+static inline result_t os_epoll_create(err_t *e, int32_t flags,
+                                       int32_t *fd_out)
+{
+    long r = sys_call1(SYS_epoll_create1, (long)flags);
+
+    if (sys_is_err(r)) {
+        ERR_PUSH_ERRNO(e, ERR_SYSCALL, sys_errno(r));
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *fd_out = (int32_t)r;
+    return RESULT_OK;
+}
+
+/*
+ * Add, modify or drop one descriptor's interest. The event is built
+ * here rather than by the caller so there is one place that knows the
+ * kernel's layout. EPOLL_CTL_DEL ignores it, and the kernel accepts a
+ * null pointer for that case, but passing the same struct costs
+ * nothing and keeps the call one shape.
+ */
+static inline result_t os_epoll_ctl(err_t *e, int32_t epfd, int32_t op,
+                                    int32_t fd, uint32_t events,
+                                    uint64_t data)
+{
+    epoll_event_t ev;
+    long          r;
+
+    ev.events = events;
+    ev.data = data;
+
+    r = sys_call4(SYS_epoll_ctl, (long)epfd, (long)op, (long)fd, (long)&ev);
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, fd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    return RESULT_OK;
+}
+
+/*
+ * Wait for readiness. timeout is milliseconds, -1 to block and 0 to
+ * take whatever is ready and return.
+ */
+static inline result_t os_epoll_wait(err_t *e, int32_t epfd,
+                                     epoll_event_t *events, int32_t max,
+                                     int32_t timeout, int32_t *n_out)
+{
+    long r = sys_call4(SYS_epoll_wait, (long)epfd, (long)events, (long)max,
+                       (long)timeout);
+
+    if (sys_is_err(r)) {
+        ERR_PUSH_FD(e, ERR_SYSCALL, epfd);
+        return RESULT_ERR(ERR_SYSCALL, sys_errno(r));
+    }
+    *n_out = (int32_t)r;
+    return RESULT_OK;
+}
+
 /* ---- Plain socket read/write, for callers not driving a ring ---- */
 
 static inline ssize_t os_read_raw(int32_t fd, void *buf, size_t count)

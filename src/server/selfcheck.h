@@ -33,6 +33,7 @@ int selfcheck_send_failure(void);
 int selfcheck_replication(void);
 int selfcheck_conn_framing(void);
 int selfcheck_conn_session(void);
+int selfcheck_epoll(void);
 int selfcheck_uring(void);
 int selfcheck_err(err_t *e);
 
