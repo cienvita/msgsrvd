@@ -52,9 +52,6 @@
 #define SYS_signalfd4       289
 #define SYS_eventfd2        290
 #define SYS_epoll_create1   291
-#define SYS_io_uring_setup  425
-#define SYS_io_uring_enter  426
-#define SYS_io_uring_register 427
 
 /* Raw syscall with 0-6 arguments */
 static inline long sys_call0(long n)

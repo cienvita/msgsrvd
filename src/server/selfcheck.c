@@ -12,7 +12,6 @@
 #include "wal/index.h"
 #include "server/session.h"
 #include "sys/os.h"
-#include "io/uring.h"
 #include "server/loop.h"
 #include "server/selfcheck.h"
 
@@ -1821,7 +1820,7 @@ int selfcheck_loop(void)
 
     session_table_init(&sessions);
     if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
-        DBG_LOG("loop: init failed (io_uring unavailable?), skipping");
+        DBG_LOG("loop: init failed, skipping");
         dbg_err_print(&e);
         wal_close(&w, &e);
         tmp_dir_destroy(dir);
@@ -3361,131 +3360,6 @@ out:
     return rc;
 }
 
-/*
- * Completion bookkeeping for the ring check. uring_reap takes a bare
- * function pointer with no context, so the callback reports through
- * file scope.
- */
-static int32_t  uring_seen;
-static uint64_t uring_data_sum;
-static int32_t  uring_bad_res;
-
-static void uring_count_cb(void *ctx, uint64_t user_data, int32_t res,
-                           uint32_t flags)
-{
-    (void)ctx;
-    (void)flags;
-    uring_seen++;
-    uring_data_sum += user_data;
-    if (res != 0)
-        uring_bad_res++;
-}
-
-int selfcheck_uring(void)
-{
-    uring_t  ring;
-    err_t    uring_err;
-    result_t r;
-    uint32_t submitted = 0;
-    int32_t  i;
-
-    err_init(&uring_err);
-    r = uring_init(&ring, &uring_err, 8);
-    if (!result_ok(r)) {
-        DBG_LOG("uring_init failed (errno=%d), skipping",
-                uring_err.frames[0].detail.u.errno_val);
-        return 0;
-    }
-
-    if (ring.ring_fd <= 0 ||
-        ring.sq_head == NULL || ring.sq_tail == NULL ||
-        ring.cq_head == NULL || ring.cq_tail == NULL ||
-        ring.sqes == NULL || ring.cqes == NULL) {
-        DBG_LOG("uring: ring pointers not populated");
-        uring_destroy(&ring);
-        return 1;
-    }
-    DBG_LOG("uring: init ok (fd=%d, sq=%u, cq=%u)",
-            ring.ring_fd, *ring.sq_entries_ptr, *ring.cq_entries_ptr);
-
-    /*
-     * Each claim must hand back a distinct slot. Sharing one would
-     * make every batch collapse to its last entry, which submits and
-     * completes without complaint and loses the rest.
-     */
-    {
-        io_uring_sqe_t *a = uring_get_sqe(&ring);
-        io_uring_sqe_t *b = uring_get_sqe(&ring);
-
-        if (!a || !b || a == b) {
-            DBG_LOG("uring: get_sqe handed out the same slot twice");
-            uring_destroy(&ring);
-            return 1;
-        }
-        uring_prep_nop(a, 1);
-        uring_prep_nop(b, 2);
-
-        if (!result_ok(uring_submit(&ring, &uring_err, &submitted)) ||
-            submitted != 2) {
-            DBG_LOG("uring: submitted %u of 2", submitted);
-            uring_destroy(&ring);
-            return 1;
-        }
-    }
-
-    /* Both come back, carrying the user data they were given */
-    uring_seen = 0;
-    uring_data_sum = 0;
-    uring_bad_res = 0;
-    if (!result_ok(uring_submit_and_wait(&ring, &uring_err, 2, &submitted))) {
-        DBG_LOG("uring: wait failed");
-        uring_destroy(&ring);
-        return 1;
-    }
-    if (uring_reap(&ring, uring_count_cb, NULL) != 2 || uring_seen != 2 ||
-        uring_data_sum != 3 || uring_bad_res != 0) {
-        DBG_LOG("uring: reaped %d completions, sum %d", uring_seen,
-                (int32_t)uring_data_sum);
-        uring_destroy(&ring);
-        return 1;
-    }
-
-    /*
-     * A second reap finds nothing. If the first had not released the
-     * slots it consumed, the same completions would be delivered again
-     * and every one of them handled twice.
-     */
-    if (uring_reap(&ring, uring_count_cb, NULL) != 0 || uring_seen != 2) {
-        DBG_LOG("uring: completions delivered twice");
-        uring_destroy(&ring);
-        return 1;
-    }
-
-    /* A full ring says so rather than overwriting what is in flight */
-    for (i = 0; i < (int32_t)*ring.sq_entries_ptr; i++) {
-        if (!uring_get_sqe(&ring)) {
-            DBG_LOG("uring: ring reported full after %d of %u", i,
-                    *ring.sq_entries_ptr);
-            uring_destroy(&ring);
-            return 1;
-        }
-    }
-    if (uring_get_sqe(&ring) != NULL) {
-        DBG_LOG("uring: full ring handed out another slot");
-        uring_destroy(&ring);
-        return 1;
-    }
-    DBG_LOG("uring: submit and completion round trip: ok");
-
-    uring_destroy(&ring);
-    if (ring.ring_fd != -1) {
-        DBG_LOG("uring: destroy did not clear fd");
-        return 1;
-    }
-    DBG_LOG("uring: destroy ok");
-    return 0;
-}
-
 int selfcheck_err(err_t *e)
 {
     ERR_PUSH(e, ERR_STORAGE);
@@ -4018,8 +3892,6 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_conn_session())
         return 1;
     if (selfcheck_epoll())
-        return 1;
-    if (selfcheck_uring())
         return 1;
     if (selfcheck_sessions())
         return 1;

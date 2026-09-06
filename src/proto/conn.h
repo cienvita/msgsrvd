@@ -108,7 +108,7 @@ int32_t conn_recv_append(conn_t *c, const uint8_t *src, int32_t n);
  * Free space at the end of the receive buffer, and where it starts.
  *
  * These exist for a caller that hands the buffer to the kernel instead
- * of copying into it: io_uring is told to read into conn_recv_ptr for
+ * of copying into it: the recv reads into conn_recv_ptr for
  * conn_recv_space bytes, and conn_recv_commit accounts for what
  * arrived. conn_recv_append is the copying counterpart, for bytes the
  * caller already holds.

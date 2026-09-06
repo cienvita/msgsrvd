@@ -34,7 +34,6 @@ int selfcheck_replication(void);
 int selfcheck_conn_framing(void);
 int selfcheck_conn_session(void);
 int selfcheck_epoll(void);
-int selfcheck_uring(void);
 int selfcheck_err(err_t *e);
 
 /* Run every check in order. Returns 0 if all passed. */
