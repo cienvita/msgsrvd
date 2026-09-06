@@ -112,29 +112,6 @@ Runs the in-process checks and exits. There is no external test
 harness: a binary with no libc is easier to exercise from inside
 itself than to link into one.
 
-## Client
-
-`clients/rust/` holds `msgsrv-client`, a tokio client. It pipelines
-writes behind a window, resolves each on the cumulative acknowledgement
-that covers it, and on a lost connection resumes its session and sends
-the queue again from the front, which the server deduplicates. It also
-follows the log: `subscribe` yields records as the node flushes them
-and resumes from the record after the last one delivered when a
-connection is remade, and `read` is the same stream bounded to what
-the node held when it was asked.
-
-`msgsrv` in the same crate is the hand tool: it writes a record at a
-time and prints the answer, says which node is the leader, reads
-records out of a log, and shows how far each node has got. Three of
-these on loopback, one plain and two with `--leader` pointed at it, is
-a cluster you can kill things in.
-
-Its tests run a real server, so build one first:
-
-    make msgsrvd
-    make client-test
-
-
 ## Status
 
 Durable on the node that takes the write, and on a replica when the

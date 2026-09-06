@@ -47,19 +47,10 @@ $(BUILD)/tiny $(BUILD)/tinye: $(BUILD)/%: src/server/%.c $(HDRS) | $(BUILD)
 $(BUILD):
 	mkdir -p $@
 
-# The Rust client. Its tests run a real server, so the binary is a
-# prerequisite rather than something the test run is expected to find.
-client:
-	cd clients/rust && cargo build --release
-
-client-test: $(BUILD)/msgsrvd
-	cd clients/rust && cargo test --lib --test integration
-	cd clients/rust && cargo test --doc
-
 docker:
 	docker build -t msgsrvd-tiny:latest .
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all debug clean docker msgsrvd tiny tinye client client-test
+.PHONY: all debug clean docker msgsrvd tiny tinye
