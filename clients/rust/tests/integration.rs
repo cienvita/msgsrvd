@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 use common::*;
-use msgsrv_client::proto::{err, op};
+use msgsrv_client::proto::{err, flag, op, Header};
 use msgsrv_client::{Client, Durability, Error, Watch, WriteAck};
 
 /* ---- tests ---- */
@@ -244,6 +244,51 @@ async fn a_record_over_the_cap_never_reaches_the_wire() {
 
     srv.kill().await;
     assert_eq!(recovered_records(dir.path(), port).await, 1);
+}
+
+/// A client that leaves before reading its acknowledgements must not
+/// take the server with it.
+///
+/// A send to a socket whose peer has gone raises SIGPIPE unless the
+/// send says otherwise, and the daemon blocks no signal it does not
+/// read through a descriptor, so the default action would end the
+/// process. It takes two sends to see it: the first is answered with a
+/// reset, and only the one after that gets EPIPE. So the writes are
+/// pipelined deep enough that the acknowledgements do not fit in one.
+/// Every other test here reads its replies, which is why this one has
+/// to exist.
+#[tokio::test]
+async fn a_client_that_leaves_before_its_reply_does_not_take_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = test_port();
+    let mut srv = Server::start(dir.path(), port).await;
+
+    for round in 1..=8u64 {
+        let mut sock = TcpStream::connect(srv.addr()).await.unwrap();
+        hello(&mut sock, 0)
+            .await
+            .expect("the server is still taking connections");
+
+        for i in 1..=300u64 {
+            let h = Header::new(
+                op::WRITE,
+                flag::ACK_REQ | flag::SYNC,
+                4,
+                7,
+                round * 1000 + i,
+            );
+            send_frame(&mut sock, &h, b"gone").await;
+        }
+        drop(sock);
+    }
+
+    /* Still up, and still taking writes. */
+    let c = Client::connect(config(srv.addr())).await.unwrap();
+    c.write(0, b"after".to_vec(), Durability::Sync)
+        .await
+        .expect("the server survived every client that walked away");
+
+    srv.kill().await;
 }
 
 #[tokio::test]

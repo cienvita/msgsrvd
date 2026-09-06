@@ -334,7 +334,7 @@ static int run_server(const char *dir, uint32_t bind_ip, const char *bind_text,
      * signals are held rather than defaulting to killing the process.
      */
     if (!result_ok(os_sigblock(&e, mask)) ||
-        !result_ok(os_signalfd(&e, mask, SFD_CLOEXEC, &sig_fd))) {
+        !result_ok(os_signalfd(&e, mask, SFD_CLOEXEC | SFD_NONBLOCK, &sig_fd))) {
         out(2, "msgsrvd: cannot take a signal descriptor\n");
         goto out_wal;
     }
@@ -344,11 +344,8 @@ static int run_server(const char *dir, uint32_t bind_ip, const char *bind_text,
         goto out_wal;
     }
 
-    if (!result_ok(loop_init(&loop, &e, &wal, &sessions, bind_ip, port,
-                             256))) {
-        out(2, "msgsrvd: cannot start the event loop. If this is an EL\n"
-               "kernel, check kernel.io_uring_disabled: it ships at 2,\n"
-               "which turns io_uring off for everything.\n");
+    if (!result_ok(loop_init(&loop, &e, &wal, &sessions, bind_ip, port))) {
+        out(2, "msgsrvd: cannot start the event loop\n");
         dbg_err_print(&e);
         os_close(&e, sig_fd);
         goto out_wal;

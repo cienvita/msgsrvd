@@ -5,15 +5,14 @@
 #include "core/err.h"
 #include "proto/conn.h"
 #include "wal/wal.h"
-#include "io/uring.h"
 #include "server/session.h"
 #include "sys/linux.h"
 
 /*
- * Single-threaded event loop over one io_uring.
+ * Single-threaded event loop over one epoll instance.
  *
  * Group commit is the reason the loop is shaped the way it is. A tick
- * drains every completion the kernel has ready, appending each write
+ * dispatches every event the kernel has ready, appending each write
  * it finds, and flushes once at the end. The batch is therefore
  * whatever arrived while the previous flush was in progress, with no
  * timer deciding when to stop waiting: the flush itself is the delay.
@@ -120,20 +119,17 @@ typedef struct {
     loop_ack_t  ack_repl;       /* owed once a replica confirms */
     loop_sub_t  sub;            /* what this connection is following */
     bool_t      in_use;
-    bool_t      recv_pending;   /* a read is with the kernel */
-    bool_t      send_pending;   /* a write is with the kernel */
+    bool_t      want_out;       /* EPOLLOUT is registered for this slot */
     bool_t      closing;
-    uint8_t     _pad[4];
+    uint8_t     _pad[5];
 } loop_conn_t;
 
 typedef struct {
-    uring_t         ring;
+    int32_t         epoll_fd;
     wal_t          *wal;
     int32_t         listen_fd;
     int32_t         signal_fd;      /* -1 when nothing is watching signals */
-    bool_t          signal_pending;
     int32_t         port;           /* host byte order, after binding */
-    bool_t          accept_pending;
     bool_t          stop;
 
     loop_conn_t     conns[LOOP_MAX_CONNS];
@@ -146,7 +142,19 @@ typedef struct {
 
     /* Set during a tick when a record was appended and not yet flushed */
     bool_t          wal_dirty;
-    uint8_t         _pad2[3];
+
+    /*
+     * Set when a pass moved a subscription or a replica's stream on
+     * and may have more of it to give.
+     *
+     * The ring woke the loop with completions of its own, so a pass
+     * that had sent something was always followed by another. epoll
+     * reports only what the outside world does, and a log being read
+     * out is nobody's doing but this loop's, so a pass that made
+     * progress says so and the next one does not wait to be told.
+     */
+    bool_t          progress;
+    uint8_t         _pad2[2];
 
     /*
      * Replication.
@@ -157,12 +165,10 @@ typedef struct {
      * leader has no one to stream from.
      */
     bool_t          is_follower;
-    bool_t          timer_pending;
     bool_t          repl_connecting;
-    bool_t          repl_recv_pending;
-    bool_t          repl_send_pending;
+    bool_t          repl_want_out;
     bool_t          repl_closing;
-    uint8_t         _pad3[2];
+    uint8_t         _pad3[4];
     int32_t         timer_fd;       /* -1 until something needs a clock */
     uint32_t        tick;           /* timer expiries seen */
 
@@ -217,8 +223,8 @@ result_t loop_set_leader(loop_t *l, err_t *e, const sockaddr_in_t *addr,
                          const char *text);
 
 /*
- * Bind, listen, and prepare the ring. port 0 asks the kernel to choose
- * one, which it reports back in l->port.
+ * Bind, listen, and prepare the epoll instance. port 0 asks the kernel
+ * to choose one, which it reports back in l->port.
  *
  * bind_ip is in host byte order. A node on the fleet binds its mesh
  * address and nothing else: the port carries client writes and the
@@ -227,14 +233,14 @@ result_t loop_set_leader(loop_t *l, err_t *e, const sockaddr_in_t *addr,
  */
 result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
                    session_table_t *sessions, uint32_t bind_ip,
-                   uint16_t port, uint32_t ring_entries);
+                   uint16_t port);
 
 /*
- * One pass: submit what is queued, take the completions that are
- * ready, flush the log once if anything was appended, then send the
- * replies that were waiting on it.
+ * One pass: dispatch every descriptor the kernel reports ready, flush
+ * the log once if anything was appended, then send the replies that
+ * were waiting on it.
  *
- * With wait set, the loop blocks until at least one completion is
+ * With wait set, the loop blocks until at least one descriptor is
  * ready. Without it the pass returns having done whatever was
  * possible, which is what a caller driving the loop by hand wants.
  */
@@ -247,10 +253,11 @@ result_t loop_run(loop_t *l, err_t *e);
 void loop_shutdown(loop_t *l);
 
 /*
- * The OP_SEND completion handler, which tick_cb routes to. Not static
- * because the self-check hands it completions directly: the failure it
- * guards against needs a send to fail while bytes are staged, and the
- * kernel cannot be relied on to produce that on cue.
+ * What a finished send does with the slot, given the bytes it moved or
+ * the errno it failed with. Not static because the self-check calls it
+ * directly: the failure it guards against needs a send to fail while
+ * bytes are staged, and the kernel cannot be relied on to produce that
+ * on cue.
  */
 void loop_send_done(loop_t *l, int32_t slot, int32_t res);
 

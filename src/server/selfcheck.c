@@ -1820,7 +1820,7 @@ int selfcheck_loop(void)
     }
 
     session_table_init(&sessions);
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
         DBG_LOG("loop: init failed (io_uring unavailable?), skipping");
         dbg_err_print(&e);
         wal_close(&w, &e);
@@ -2340,7 +2340,7 @@ int selfcheck_session_recovery(void)
         tmp_dir_destroy(dir);
         return 1;
     }
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
         DBG_LOG("session recovery: loop unavailable, skipping");
         wal_close(&w, &e);
         tmp_dir_destroy(dir);
@@ -2407,7 +2407,7 @@ int selfcheck_session_recovery(void)
         }
     }
 
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
         DBG_LOG("session recovery: second loop failed");
         wal_close(&w, &e);
         tmp_dir_destroy(dir);
@@ -3541,7 +3541,7 @@ int selfcheck_send_failure(void)
         tmp_dir_destroy(dir);
         return 1;
     }
-    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
         DBG_LOG("send failure: loop unavailable, skipping");
         wal_close(&w, &e);
         tmp_dir_destroy(dir);
@@ -3564,7 +3564,6 @@ int selfcheck_send_failure(void)
         c->send_cap = (int32_t)sizeof(staged);
         mem_copy(staged, (const uint8_t *)"ABCDEF", 6);
         c->send_len = 6;
-        c->send_pending = TRUE;
 
         loop_send_done(&l, 1, 2);
 
@@ -3578,7 +3577,49 @@ int selfcheck_send_failure(void)
         c->in_use = FALSE;
         c->replica = -1;
         c->send_len = 0;
-        c->send_pending = FALSE;
+    }
+
+    /*
+     * A send that failed takes the staged bytes with it and ends the
+     * connection.
+     *
+     * Under the ring this was reachable only through the strand below:
+     * a slot with a write in flight was never released, so a handler
+     * that kept the bytes held the slot for ever. epoll has no such
+     * flag and the slot would come free by another route, so the
+     * contract is asserted here rather than inferred from what the
+     * loop does with it afterwards.
+     */
+    {
+        loop_conn_t *c = &l.conns[1];
+
+        c->in_use = TRUE;
+        c->fd = -1;
+        c->send_buf = staged;
+        c->send_cap = (int32_t)sizeof(staged);
+        mem_copy(staged, (const uint8_t *)"doomed", 6);
+        c->send_len = 6;
+
+        loop_send_done(&l, 1, -EPIPE);
+        if (c->send_len != 0 || !c->closing) {
+            DBG_LOG("send failure: a failed send kept %d bytes, closing %d",
+                    c->send_len, (int32_t)c->closing);
+            goto out;
+        }
+
+        /* A send that moved nothing is the same thing: repeated, it is
+         * the same loop with nothing to break it. */
+        c->closing = FALSE;
+        c->send_len = 6;
+        loop_send_done(&l, 1, 0);
+        if (c->send_len != 0 || !c->closing) {
+            DBG_LOG("send failure: a send that moved nothing was let pass");
+            goto out;
+        }
+
+        c->in_use = FALSE;
+        c->send_len = 0;
+        c->closing = FALSE;
     }
 
     /*
@@ -3605,13 +3646,12 @@ int selfcheck_send_failure(void)
         c->send_cap = (int32_t)sizeof(staged);
         mem_copy(staged, (const uint8_t *)"doomed", 6);
         c->send_len = 6;
-        c->send_pending = TRUE;
     }
 
     /*
      * Shut the leader's own descriptor for writing, so that if the
-     * handler wrongly keeps the staged bytes and resubmits them, the
-     * resubmission fails with EPIPE every time. Closing the peer was
+     * handler wrongly keeps the staged bytes and sends them again, the
+     * second send fails with EPIPE every time. Closing the peer was
      * tried first and is not enough: the first resend can land in the
      * dying socket before the reset is processed, succeed, and hide
      * the leak, which is the same nondeterminism that kept this bug
@@ -3771,12 +3811,12 @@ int selfcheck_replication(void)
         goto out_dirs;
     }
 
-    if (!result_ok(loop_init(&leader, &e, &lw, &lsessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&leader, &e, &lw, &lsessions, 0x7F000001, 0))) {
         DBG_LOG("replication: loop unavailable, skipping");
         rc = 0;
         goto out_wal;
     }
-    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001, 0))) {
         DBG_LOG("replication: second loop failed");
         loop_shutdown(&leader);
         goto out_wal;
@@ -3918,7 +3958,7 @@ int selfcheck_replication(void)
      * sent what it missed. That is the path a restart takes, and the
      * only one that reads the log rather than the batch in hand.
      */
-    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001, 0, 64))) {
+    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001, 0))) {
         DBG_LOG("replication: the replica could not start again");
         goto out_loops;
     }

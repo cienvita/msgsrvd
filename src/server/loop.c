@@ -3,18 +3,20 @@
 #include "sys/os.h"
 
 /*
- * Completion identity. The kind is in the top byte and the slot index
- * in the low bits, so a completion says what finished and for whom
- * without any lookup table.
+ * Event identity. The kind of descriptor is in the top byte and the
+ * slot index in the low bits, so an event says what is ready and for
+ * whom without any lookup table.
+ *
+ * The kind is the descriptor rather than the operation, because epoll
+ * registers interest per descriptor and one report can carry both
+ * directions at once. Which direction it is comes from the event bits,
+ * not from the word.
  */
-#define OP_ACCEPT   1
-#define OP_RECV     2
-#define OP_SEND     3
-#define OP_SIGNAL   4
-#define OP_TIMER    5
-#define OP_REPL_DIAL 6
-#define OP_REPL_RECV 7
-#define OP_REPL_SEND 8
+#define OP_LISTEN   1
+#define OP_CONN     2
+#define OP_SIGNAL   3
+#define OP_TIMER    4
+#define OP_STREAM   5
 
 #define UD_MAKE(op, slot)   (((uint64_t)(op) << 56) | (uint64_t)(uint32_t)(slot))
 #define UD_OP(ud)           ((int32_t)((ud) >> 56))
@@ -96,10 +98,10 @@ static void replica_release(loop_t *l, int32_t idx)
 }
 
 /*
- * Give up a slot once the kernel holds nothing for it. A slot with an
- * operation still in flight keeps its buffers until that completion
- * arrives, or the kernel would be writing into a slot handed to
- * another connection.
+ * Give up a slot. Only ever called from the arm phase, once the events
+ * of this pass have all been dispatched: an event array still being
+ * walked can name the slot, and handing it to another connection
+ * underneath that would misdirect whatever the array had left.
  */
 static void slot_release(loop_t *l, int32_t i)
 {
@@ -107,8 +109,6 @@ static void slot_release(loop_t *l, int32_t i)
     err_t        e;
 
     if (!c->in_use)
-        return;
-    if (c->recv_pending || c->send_pending)
         return;
 
     if (c->replica >= 0)
@@ -123,6 +123,12 @@ static void slot_release(loop_t *l, int32_t i)
 
     if (c->fd >= 0) {
         err_init(&e);
+        /*
+         * Closing the descriptor drops it from the epoll set on its
+         * own. Saying so first costs one call and leaves the intent on
+         * the page rather than in the kernel's semantics.
+         */
+        os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_DEL, c->fd, 0, 0);
         os_close(&e, c->fd);
     }
     slot_reset(l, i);
@@ -682,6 +688,7 @@ static void subs_push(loop_t *l, uint8_t *scratch, int32_t scratch_len)
                 if (c->sub.once)
                     c->sub.until = durable;
                 reply(c, i, MSG_OP_ACK, 0, c->sub.cursor.next_seq, NULL, 0);
+                l->progress = TRUE;
             } else if (l->tick >= c->sub.deadline) {
                 c->sub.waiting = FALSE;
                 reply_err(c, i, MSG_ERR_BEHIND, c->sub.min_seq);
@@ -691,7 +698,7 @@ static void subs_push(loop_t *l, uint8_t *scratch, int32_t scratch_len)
             continue;
         }
 
-        if (!c->sub.active || c->send_pending)
+        if (!c->sub.active || c->want_out)
             continue;
 
         room = c->send_cap - c->send_len;
@@ -720,6 +727,16 @@ static void subs_push(loop_t *l, uint8_t *scratch, int32_t scratch_len)
             c->closing = TRUE;
             continue;
         }
+
+        /*
+         * The cursor moved, so there may be more behind what it took,
+         * and the frame that ends a read is itself a further pass. A
+         * pass that read nothing sets nothing and the loop goes back
+         * to waiting, which is what keeps this from spinning on a
+         * record too large for the buffer.
+         */
+        if (got > 0)
+            l->progress = TRUE;
 
         while (at < got) {
             wal_rec_t rec;
@@ -826,7 +843,7 @@ static void repl_stream(loop_t *l)
 
         if (!c->in_use || c->closing || idx < 0)
             continue;
-        if (c->send_pending || c->send_len > 0)
+        if (c->send_len > 0)
             continue;               /* the last chunk has not gone yet */
 
         first = l->peer_cursor[idx].next_seq;
@@ -839,6 +856,7 @@ static void repl_stream(loop_t *l)
         }
         if (n == 0)
             continue;
+        l->progress = TRUE;
 
         {
             msg_header_t h = msg_header_new(MSG_OP_REPL_DATA, MSG_RECORD_NONE,
@@ -867,20 +885,20 @@ static void stream_frame(loop_t *l, uint16_t op, uint64_t sequence)
     l->repl_send_len += MSG_HEADER_SIZE;
 }
 
-/* Give up the stream once the kernel holds nothing for it. */
+/* Give up the stream. Called from the arm phase, like slot_release. */
 static void stream_release(loop_t *l)
 {
     err_t e;
 
-    if (l->repl_fd < 0)
-        return;
-    if (l->repl_recv_pending || l->repl_send_pending || l->repl_connecting)
+    if (l->repl_fd < 0 || l->repl_connecting)
         return;
 
     err_init(&e);
+    os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_DEL, l->repl_fd, 0, 0);
     os_close(&e, l->repl_fd);
     l->repl_fd = -1;
     l->repl_closing = FALSE;
+    l->repl_want_out = FALSE;
     l->repl_send_len = 0;
     l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
 }
@@ -1058,15 +1076,25 @@ static void on_accept(loop_t *l, int32_t res)
     int32_t slot;
     err_t   e;
 
-    l->accept_pending = FALSE;
-
     if (res < 0)
         return;
+
+    err_init(&e);
 
     slot = slot_alloc(l);
     if (slot < 0) {
         /* No room: refuse now rather than hold a connection we cannot serve */
-        err_init(&e);
+        os_close(&e, res);
+        return;
+    }
+
+    /*
+     * Readable only. A socket with room to write is nearly always
+     * writable, so a slot that carried EPOLLOUT from the start would
+     * wake the loop every pass with nothing to say.
+     */
+    if (!result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_ADD, res, EPOLLIN,
+                                UD_MAKE(OP_CONN, slot)))) {
         os_close(&e, res);
         return;
     }
@@ -1087,8 +1115,6 @@ static void on_recv(tick_ctx_t *tc, int32_t slot, int32_t res)
     int32_t        n;
     int32_t        i;
 
-    c->recv_pending = FALSE;
-
     if (!c->in_use)
         return;
 
@@ -1098,7 +1124,7 @@ static void on_recv(tick_ctx_t *tc, int32_t slot, int32_t res)
         return;
     }
 
-    /* io_uring read straight into the buffer, so this only accounts. */
+    /* The recv read straight into the buffer, so this only accounts. */
     conn_recv_commit(&c->conn, res);
 
     for (;;) {
@@ -1132,8 +1158,6 @@ static void on_recv(tick_ctx_t *tc, int32_t slot, int32_t res)
 void loop_send_done(loop_t *l, int32_t slot, int32_t res)
 {
     loop_conn_t *c = &l->conns[slot];
-
-    c->send_pending = FALSE;
 
     if (!c->in_use)
         return;
@@ -1175,13 +1199,27 @@ static void on_repl_dial(loop_t *l, int32_t res)
     err_t e;
 
     l->repl_connecting = FALSE;
+    err_init(&e);
 
     if (res < 0) {
-        err_init(&e);
-        if (l->repl_fd >= 0)
+        if (l->repl_fd >= 0) {
+            os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_DEL, l->repl_fd, 0, 0);
             os_close(&e, l->repl_fd);
+        }
         l->repl_fd = -1;
         l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
+        return;
+    }
+
+    /*
+     * The dial was watched for writability, which is how a connect
+     * that was still in progress reports itself. Connected, the stream
+     * wants to hear about records arriving instead.
+     */
+    l->repl_want_out = FALSE;
+    if (!result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_MOD, l->repl_fd,
+                                EPOLLIN, UD_MAKE(OP_STREAM, 0)))) {
+        l->repl_closing = TRUE;
         return;
     }
 
@@ -1205,8 +1243,6 @@ static void on_repl_recv(loop_t *l, int32_t res, uint8_t *scratch,
     conn_action_t actions[4];
     int32_t       n;
     int32_t       i;
-
-    l->repl_recv_pending = FALSE;
 
     if (l->repl_fd < 0)
         return;
@@ -1236,8 +1272,6 @@ static void on_repl_recv(loop_t *l, int32_t res, uint8_t *scratch,
 
 static void on_repl_send(loop_t *l, int32_t res)
 {
-    l->repl_send_pending = FALSE;
-
     if (l->repl_fd < 0)
         return;
     if (res < 0) {
@@ -1254,123 +1288,337 @@ static void on_repl_send(loop_t *l, int32_t res)
     }
 }
 
-static void tick_cb(void *ctx, uint64_t user_data, int32_t res, uint32_t flags)
-{
-    tick_ctx_t *tc = (tick_ctx_t *)ctx;
-    int32_t     slot = UD_SLOT(user_data);
+/* ---- interest ---- */
 
-    (void)flags;
+/*
+ * Carry EPOLLOUT for a slot, or stop carrying it.
+ *
+ * A socket with room in its send buffer is writable, which is nearly
+ * always, so a slot registered for EPOLLOUT with nothing staged would
+ * wake the loop on every pass to be told what it already knew. The
+ * interest goes on only when a send could not take everything, and
+ * comes off as soon as it has.
+ */
+static void conn_want_out(loop_t *l, int32_t i, bool_t want)
+{
+    loop_conn_t *c = &l->conns[i];
+    uint32_t     events = EPOLLIN;
+    err_t        e;
+
+    if (c->fd < 0 || (c->want_out ? TRUE : FALSE) == want)
+        return;
+
+    if (want)
+        events = EPOLLIN | EPOLLOUT;
+
+    err_init(&e);
+    if (!result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_MOD, c->fd,
+                                events, UD_MAKE(OP_CONN, i)))) {
+        /*
+         * Nothing left to try. Without the change the staged bytes
+         * either never go out or wake the loop for ever, and ending
+         * the connection at least says so to the client.
+         */
+        c->closing = TRUE;
+        return;
+    }
+    c->want_out = want;
+}
+
+/* The same for the follower's one stream. */
+static void stream_want_out(loop_t *l, bool_t want)
+{
+    uint32_t events = EPOLLIN;
+    err_t    e;
+
+    if (l->repl_fd < 0 || (l->repl_want_out ? TRUE : FALSE) == want)
+        return;
+
+    if (want)
+        events = EPOLLIN | EPOLLOUT;
+
+    err_init(&e);
+    if (!result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_MOD, l->repl_fd,
+                                events, UD_MAKE(OP_STREAM, 0)))) {
+        l->repl_closing = TRUE;
+        return;
+    }
+    l->repl_want_out = want;
+}
+
+/* ---- doing what an event says is possible ---- */
+
+/*
+ * epoll reports readiness; the ring reported completions. What sits
+ * between them is this: each of these takes the syscall the event says
+ * will not block, and hands its result to the handler above unchanged.
+ * The handlers therefore never learn which multiplexer they are under.
+ */
+
+static void do_accept(loop_t *l)
+{
+    err_t   e;
+    int32_t fd = -1;
+
+    if (l->stop)
+        return;
+
+    /*
+     * One accept per readiness report, the way the ring did one per
+     * completion. Draining the backlog here would let a burst of
+     * connections put off the flush the records already taken are
+     * waiting for.
+     */
+    err_init(&e);
+    if (!result_ok(os_accept4(&e, l->listen_fd, SOCK_NONBLOCK | SOCK_CLOEXEC,
+                              &fd)))
+        return;
+
+    on_accept(l, fd);
+}
+
+/*
+ * One receive per connection per pass, for the room the framing layer
+ * has. Reading until EAGAIN would let one fast client fill the batch
+ * on its own and push out the flush every other connection is waiting
+ * for, which is the shape the group commit argument rests on.
+ */
+static void do_recv(tick_ctx_t *tc, int32_t slot)
+{
+    loop_conn_t *c = &tc->l->conns[slot];
+    int32_t      space;
+    int32_t      res = 0;
+
+    if (!c->in_use || c->fd < 0)
+        return;
+
+    /*
+     * The arm phase reclaimed the parsed bytes and closed the
+     * connection if there was no room left, so a slot arriving here
+     * with none has already been dealt with.
+     */
+    space = conn_recv_space(&c->conn);
+    if (space <= 0)
+        return;
+
+    os_recv(c->fd, conn_recv_ptr(&c->conn), space, MSG_DONTWAIT, &res);
+
+    /*
+     * Readiness is not a promise. A wake can be spurious, or an
+     * earlier event in the same pass can have taken what this one was
+     * reported for, and neither is the connection ending.
+     */
+    if (res == -EAGAIN)
+        return;
+
+    on_recv(tc, slot, res);
+}
+
+/* Push what is staged. The caller has already decided there is some. */
+static void conn_send(loop_t *l, int32_t i)
+{
+    loop_conn_t *c = &l->conns[i];
+    int32_t      res = 0;
+
+    os_send(c->fd, c->send_buf, c->send_len, MSG_NOSIGNAL | MSG_DONTWAIT,
+            &res);
+
+    /*
+     * A socket that cannot take anything right now has moved zero
+     * bytes, not failed. loop_send_done reads any result at or below
+     * zero as the end of the connection, so this one never reaches it.
+     */
+    if (res == -EAGAIN) {
+        conn_want_out(l, i, TRUE);
+        return;
+    }
+
+    loop_send_done(l, i, res);
+    conn_want_out(l, i, c->send_len > 0 ? TRUE : FALSE);
+}
+
+static void do_send(loop_t *l, int32_t i)
+{
+    loop_conn_t *c = &l->conns[i];
+
+    if (!c->in_use || c->fd < 0)
+        return;
+    if (c->send_len <= 0) {
+        conn_want_out(l, i, FALSE);
+        return;
+    }
+    conn_send(l, i);
+}
+
+static void do_signal(loop_t *l)
+{
+    ssize_t n;
+
+    if (l->signal_fd < 0)
+        return;
+
+    n = os_read_raw(l->signal_fd, signal_buf, sizeof(signal_buf));
+
+    /*
+     * Stop after this pass rather than here, so a record appended
+     * moments ago still gets the flush it is owed.
+     */
+    if (n > 0)
+        l->stop = TRUE;
+}
+
+static void do_timer(loop_t *l)
+{
+    ssize_t n;
+
+    if (l->timer_fd < 0)
+        return;
+
+    n = os_read_raw(l->timer_fd, timer_buf, sizeof(timer_buf));
+    if (n == TIMERFD_READ_SIZE) {
+        uint64_t fired = 0;
+
+        mem_copy((uint8_t *)&fired, timer_buf, TIMERFD_READ_SIZE);
+        /* Count what expired, not what was noticed: a pass that ran
+         * long must not make a deadline shorter than it is. */
+        l->tick += (uint32_t)fired;
+    }
+}
+
+/*
+ * A connect left in progress reports itself as writable, and the
+ * result is in SO_ERROR: zero for connected, an errno otherwise.
+ * Reading it also clears it, so it is asked for exactly once.
+ */
+static void do_repl_dial(loop_t *l)
+{
+    err_t   e;
+    int32_t so_err = 0;
+
+    err_init(&e);
+    if (!result_ok(os_getsockopt_int(&e, l->repl_fd, SOL_SOCKET, SO_ERROR,
+                                     &so_err))) {
+        on_repl_dial(l, -EIO);
+        return;
+    }
+    on_repl_dial(l, -so_err);
+}
+
+static void do_repl_recv(tick_ctx_t *tc)
+{
+    loop_t *l = tc->l;
+    int32_t space;
+    int32_t res = 0;
+
+    if (l->repl_fd < 0 || l->repl_closing)
+        return;
+
+    space = conn_recv_space(&l->repl_conn);
+    if (space <= 0)
+        return;
+
+    os_recv(l->repl_fd, conn_recv_ptr(&l->repl_conn), space, MSG_DONTWAIT,
+            &res);
+    if (res == -EAGAIN)
+        return;
+
+    on_repl_recv(l, res, tc->scratch, tc->scratch_len);
+}
+
+static void stream_send(loop_t *l)
+{
+    int32_t res = 0;
+
+    os_send(l->repl_fd, stream_send_buf, l->repl_send_len,
+            MSG_NOSIGNAL | MSG_DONTWAIT, &res);
+
+    if (res == -EAGAIN) {
+        stream_want_out(l, TRUE);
+        return;
+    }
+
+    on_repl_send(l, res);
+    stream_want_out(l, l->repl_send_len > 0 ? TRUE : FALSE);
+}
+
+static void do_repl_send(loop_t *l)
+{
+    if (l->repl_fd < 0 || l->repl_closing)
+        return;
+    if (l->repl_send_len <= 0) {
+        stream_want_out(l, FALSE);
+        return;
+    }
+    stream_send(l);
+}
+
+/*
+ * EPOLLERR and EPOLLHUP arrive whether they were asked for or not, and
+ * both mean the same thing here as readable does: take the receive and
+ * let its result end the connection.
+ */
+#define EV_READABLE (EPOLLIN | EPOLLERR | EPOLLHUP)
+
+static void tick_event(tick_ctx_t *tc, uint64_t user_data, uint32_t events)
+{
+    loop_t *l = tc->l;
+    int32_t slot = UD_SLOT(user_data);
 
     switch (UD_OP(user_data)) {
-    case OP_ACCEPT:
-        on_accept(tc->l, res);
+    case OP_LISTEN:
+        do_accept(l);
         break;
-    case OP_RECV:
-        on_recv(tc, slot, res);
-        break;
-    case OP_SEND:
-        loop_send_done(tc->l, slot, res);
-        break;
-    case OP_TIMER:
-        tc->l->timer_pending = FALSE;
-        if (res == TIMERFD_READ_SIZE) {
-            uint64_t fired = 0;
-
-            mem_copy((uint8_t *)&fired, timer_buf, TIMERFD_READ_SIZE);
-            /* Count what expired, not what was noticed: a pass that
-             * ran long must not make a deadline shorter than it is. */
-            tc->l->tick += (uint32_t)fired;
-        }
-        break;
-    case OP_REPL_DIAL:
-        on_repl_dial(tc->l, res);
-        break;
-    case OP_REPL_RECV:
-        on_repl_recv(tc->l, res, tc->scratch, tc->scratch_len);
-        break;
-    case OP_REPL_SEND:
-        on_repl_send(tc->l, res);
+    case OP_CONN:
+        if (events & EV_READABLE)
+            do_recv(tc, slot);
+        /*
+         * Staged output goes out even on a connection that is closing,
+         * so a protocol error is reported before the socket does.
+         */
+        if (events & EPOLLOUT)
+            do_send(l, slot);
         break;
     case OP_SIGNAL:
-        tc->l->signal_pending = FALSE;
-        /*
-         * Stop after this pass rather than here, so a record appended
-         * moments ago still gets the flush it is owed.
-         */
-        if (res > 0)
-            tc->l->stop = TRUE;
+        do_signal(l);
+        break;
+    case OP_TIMER:
+        do_timer(l);
+        break;
+    case OP_STREAM:
+        if (l->repl_connecting)
+            do_repl_dial(l);
+        else {
+            if (events & EV_READABLE)
+                do_repl_recv(tc);
+            if (events & EPOLLOUT)
+                do_repl_send(l);
+        }
         break;
     default:
         break;
     }
 }
 
-/* ---- submission ---- */
-
-static void arm_accept(loop_t *l)
-{
-    io_uring_sqe_t *sqe;
-
-    if (l->accept_pending || l->stop)
-        return;
-
-    sqe = uring_get_sqe(&l->ring);
-    if (!sqe)
-        return;
-
-    uring_prep_accept(sqe, l->listen_fd, NULL, NULL, 0, UD_MAKE(OP_ACCEPT, 0));
-    l->accept_pending = TRUE;
-}
-
-static void arm_signal(loop_t *l)
-{
-    io_uring_sqe_t *sqe;
-
-    if (l->signal_fd < 0 || l->signal_pending || l->stop)
-        return;
-
-    sqe = uring_get_sqe(&l->ring);
-    if (!sqe)
-        return;
-
-    uring_prep_read(sqe, l->signal_fd, signal_buf,
-                    (uint32_t)sizeof(signal_buf), 0, UD_MAKE(OP_SIGNAL, 0));
-    l->signal_pending = TRUE;
-}
+/* ---- the arm phase ---- */
 
 /*
- * Queue whatever each connection is ready for.
+ * What each connection is ready for, once the events of this pass have
+ * all been dispatched and the flush they caused has happened.
  *
- * The two directions are independent: a send and a receive may be in
- * flight at once, since they use different buffers. Only a second
- * operation in the same direction is barred, which would put the
- * kernel into a buffer that is already in use.
+ * Staged bytes are sent here rather than waited on: a socket with room
+ * takes them at once, and the ring did the same thing, submitting a
+ * send at the end of a tick that had completed before the next one.
+ * Only a send that could not take everything leaves EPOLLOUT behind.
  *
- * They used to alternate, on the reasoning that a reply always
- * followed the request that caused it. Replication broke that: an
- * acknowledgement waiting on a second copy is staged passes later than
- * the write it answers, and by then the connection is holding a
- * receive that will not complete until the client sends something
- * else. The reply would wait for a request that the client, waiting
- * for the reply, has no reason to send.
- *
- * Staging into a buffer with a send already in flight is safe: the
- * kernel was given the length as it stood, and what is appended past
- * it goes out on the next pass, which is what the short-write path
- * already does.
- *
- * A slot is given up only once nothing is staged for it and nothing is
- * in flight, since the kernel would otherwise be reading into or
- * sending from buffers already handed to another connection.
+ * A slot is given up here and nowhere else. The events of the pass are
+ * done with by now, so nothing is left that could still name it.
  */
 static void arm_conns(loop_t *l)
 {
     int32_t i;
 
     for (i = 0; i < LOOP_MAX_CONNS; i++) {
-        loop_conn_t    *c = &l->conns[i];
-        io_uring_sqe_t *sqe;
-        int32_t         space;
+        loop_conn_t *c = &l->conns[i];
 
         if (!c->in_use)
             continue;
@@ -1381,22 +1629,13 @@ static void arm_conns(loop_t *l)
          * dropping the slot first would close it silently and leave
          * the client to guess.
          */
-        if (c->send_len > 0 && !c->send_pending) {
-            sqe = uring_get_sqe(&l->ring);
-            if (!sqe)
-                return;
-            uring_prep_send(sqe, c->fd, c->send_buf, (uint32_t)c->send_len,
-                            UD_MAKE(OP_SEND, i));
-            c->send_pending = TRUE;
-        }
+        if (c->send_len > 0 && !c->want_out && c->fd >= 0)
+            conn_send(l, i);
 
         if (c->closing) {
             slot_release(l, i);
             continue;
         }
-
-        if (c->recv_pending)
-            continue;
 
         /*
          * Everything parsed has been handled by now, so the room it
@@ -1404,20 +1643,11 @@ static void arm_conns(loop_t *l)
          * unparsed tail over the frames still being handled.
          */
         conn_compact(&c->conn);
-        space = conn_recv_space(&c->conn);
-        if (space <= 0) {
+        if (conn_recv_space(&c->conn) <= 0) {
             /* Nothing was consumed and there is no room to read more. */
             c->closing = TRUE;
             slot_release(l, i);
-            continue;
         }
-
-        sqe = uring_get_sqe(&l->ring);
-        if (!sqe)
-            return;
-        uring_prep_recv(sqe, c->fd, conn_recv_ptr(&c->conn), (uint32_t)space,
-                        UD_MAKE(OP_RECV, i));
-        c->recv_pending = TRUE;
     }
 }
 
@@ -1434,38 +1664,24 @@ static void arm_timer_now(loop_t *l)
         return;
 
     err_init(&e);
-    if (!result_ok(os_timerfd(&e, TFD_CLOEXEC, &l->timer_fd))) {
+    if (!result_ok(os_timerfd(&e, TFD_CLOEXEC | TFD_NONBLOCK, &l->timer_fd))) {
         l->timer_fd = -1;
         return;
     }
-    if (!result_ok(os_timerfd_period(&e, l->timer_fd, LOOP_TICK_NS))) {
+    if (!result_ok(os_timerfd_period(&e, l->timer_fd, LOOP_TICK_NS)) ||
+        !result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_ADD, l->timer_fd,
+                                EPOLLIN, UD_MAKE(OP_TIMER, 0)))) {
         os_close(&e, l->timer_fd);
         l->timer_fd = -1;
     }
 }
 
-static void arm_timer(loop_t *l)
-{
-    io_uring_sqe_t *sqe;
-
-    if (l->timer_fd < 0 || l->timer_pending || l->stop)
-        return;
-
-    sqe = uring_get_sqe(&l->ring);
-    if (!sqe)
-        return;
-
-    uring_prep_read(sqe, l->timer_fd, timer_buf, (uint32_t)sizeof(timer_buf),
-                    0, UD_MAKE(OP_TIMER, 0));
-    l->timer_pending = TRUE;
-}
-
 /* Dial the leader, once the wait since the last attempt has passed. */
 static void repl_dial(loop_t *l)
 {
-    io_uring_sqe_t *sqe;
-    err_t           e;
-    int32_t         fd = -1;
+    err_t    e;
+    result_t r;
+    int32_t  fd = -1;
 
     if (!l->is_follower || l->stop)
         return;
@@ -1475,22 +1691,39 @@ static void repl_dial(loop_t *l)
         return;
 
     err_init(&e);
-    if (!result_ok(os_socket(&e, AF_INET, SOCK_STREAM, 0, &fd))) {
+    if (!result_ok(os_socket(&e, AF_INET,
+                             SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
+                             &fd))) {
         l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
         return;
     }
 
-    sqe = uring_get_sqe(&l->ring);
-    if (!sqe) {
+    /*
+     * Watched for writability, which is how a connect that has not
+     * finished says it has.
+     */
+    if (!result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_ADD, fd, EPOLLOUT,
+                                UD_MAKE(OP_STREAM, 0)))) {
         os_close(&e, fd);
+        l->repl_next_dial = l->tick + LOOP_REDIAL_TICKS;
         return;
     }
 
     l->repl_fd = fd;
     l->repl_connecting = TRUE;
-    uring_prep_connect(sqe, fd, &l->leader_addr,
-                       (uint64_t)sizeof(l->leader_addr),
-                       UD_MAKE(OP_REPL_DIAL, 0));
+
+    /*
+     * A non-blocking connect almost always says it is still going, and
+     * the writable report carries the answer. Loopback can finish it
+     * here instead, and then there is nothing to wait for. Anything
+     * else is a refusal, and goes to the same handler as one that
+     * arrived later.
+     */
+    r = os_connect(&e, fd, &l->leader_addr);
+    if (result_ok(r))
+        on_repl_dial(l, 0);
+    else if (r.detail != EINPROGRESS)
+        on_repl_dial(l, -r.detail);
 }
 
 /*
@@ -1502,9 +1735,6 @@ static void repl_dial(loop_t *l)
  */
 static void arm_stream(loop_t *l)
 {
-    io_uring_sqe_t *sqe;
-    int32_t         space;
-
     if (l->repl_fd < 0 || l->repl_connecting || l->stop)
         return;
 
@@ -1513,31 +1743,15 @@ static void arm_stream(loop_t *l)
         return;
     }
 
-    if (l->repl_send_len > 0 && !l->repl_send_pending) {
-        sqe = uring_get_sqe(&l->ring);
-        if (!sqe)
-            return;
-        uring_prep_send(sqe, l->repl_fd, stream_send_buf,
-                        (uint32_t)l->repl_send_len, UD_MAKE(OP_REPL_SEND, 0));
-        l->repl_send_pending = TRUE;
-    }
+    if (l->repl_send_len > 0 && !l->repl_want_out)
+        stream_send(l);
 
-    if (l->repl_recv_pending)
+    if (l->repl_closing)
         return;
 
     conn_compact(&l->repl_conn);
-    space = conn_recv_space(&l->repl_conn);
-    if (space <= 0) {
+    if (conn_recv_space(&l->repl_conn) <= 0)
         l->repl_closing = TRUE;
-        return;
-    }
-
-    sqe = uring_get_sqe(&l->ring);
-    if (!sqe)
-        return;
-    uring_prep_recv(sqe, l->repl_fd, conn_recv_ptr(&l->repl_conn),
-                    (uint32_t)space, UD_MAKE(OP_REPL_RECV, 0));
-    l->repl_recv_pending = TRUE;
 }
 
 /*
@@ -1612,11 +1826,11 @@ static void stream_report(loop_t *l)
         return;
 
     /*
-     * Skipped rather than queued when a send is already with the
-     * kernel: the next report carries a sequence at least as high, so
-     * nothing is lost by not staging this one.
+     * Skipped rather than queued when the last one has not gone yet:
+     * the next report carries a sequence at least as high, so nothing
+     * is lost by not staging this one.
      */
-    if (l->repl_send_pending || l->repl_send_len > 0)
+    if (l->repl_send_len > 0)
         return;
 
     stream_frame(l, MSG_OP_REPL_ACK, durable);
@@ -1627,7 +1841,7 @@ static void stream_report(loop_t *l)
 
 result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
                    session_table_t *sessions, uint32_t bind_ip,
-                   uint16_t port, uint32_t ring_entries)
+                   uint16_t port)
 {
     sockaddr_in_t addr;
     result_t      r;
@@ -1637,6 +1851,7 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
     mem_zero((uint8_t *)l, (int32_t)sizeof(*l));
     l->wal = wal;
     l->sessions = sessions;
+    l->epoll_fd = -1;
     l->listen_fd = -1;
     l->signal_fd = -1;
     l->timer_fd = -1;
@@ -1647,13 +1862,21 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
     for (i = 0; i < LOOP_MAX_REPLICAS; i++)
         wal_cursor_init(&l->peer_cursor[i]);
 
-    r = uring_init(&l->ring, e, ring_entries);
+    r = os_epoll_create(e, EPOLL_CLOEXEC, &l->epoll_fd);
     if (!result_ok(r))
         return r;
 
-    r = os_socket(e, AF_INET, SOCK_STREAM, 0, &l->listen_fd);
+    /*
+     * The listener is non-blocking too. accept4 sets the flag on the
+     * connection it returns, not on the socket it took it from, and an
+     * accept that blocked after a readiness report that turned out to
+     * be spurious would stall every other client's flush.
+     */
+    r = os_socket(e, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
+                  &l->listen_fd);
     if (!result_ok(r)) {
-        uring_destroy(&l->ring);
+        os_close(e, l->epoll_fd);
+        l->epoll_fd = -1;
         return r;
     }
 
@@ -1678,42 +1901,56 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
         goto fail;
     l->port = (int32_t)ntohs(addr.sin_port);
 
+    r = os_epoll_ctl(e, l->epoll_fd, EPOLL_CTL_ADD, l->listen_fd, EPOLLIN,
+                     UD_MAKE(OP_LISTEN, 0));
+    if (!result_ok(r))
+        goto fail;
+
     return RESULT_OK;
 
 fail:
     os_close(e, l->listen_fd);
     l->listen_fd = -1;
-    uring_destroy(&l->ring);
+    os_close(e, l->epoll_fd);
+    l->epoll_fd = -1;
     return r;
 }
 
 result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
 {
-    tick_ctx_t tc;
+    /*
+     * Every descriptor the loop can hold at once: one per slot, plus
+     * the listener, the signalfd, the timerfd and the follower's
+     * stream. Sized so one wait can never leave an event behind.
+     */
+    static epoll_event_t events[LOOP_MAX_CONNS + 4];
     static uint8_t scratch[WAL_REC_MAX_SIZE];
+    tick_ctx_t tc;
     result_t   r;
-    uint32_t   submitted = 0;
+    int32_t    timeout;
+    int32_t    n = 0;
+    int32_t    i;
 
     tc.l = l;
     tc.scratch = scratch;
     tc.scratch_len = (int32_t)sizeof(scratch);
 
-    arm_accept(l);
-    arm_signal(l);
-    arm_timer(l);
     repl_dial(l);
     arm_conns(l);
     arm_stream(l);
 
-    if (wait)
-        r = uring_submit_and_wait(&l->ring, e, 1, &submitted);
-    else
-        r = uring_submit(&l->ring, e, &submitted);
+    timeout = (wait && !l->progress) ? -1 : 0;
+    l->progress = FALSE;
+
+    r = os_epoll_wait(e, l->epoll_fd, events,
+                      (int32_t)(sizeof(events) / sizeof(events[0])),
+                      timeout, &n);
     if (!result_ok(r))
         return r;
 
     l->wal_dirty = FALSE;
-    uring_reap(&l->ring, tick_cb, &tc);
+    for (i = 0; i < n; i++)
+        tick_event(&tc, events[i].data, events[i].events);
 
     /*
      * One flush for everything this pass appended. The batch is
@@ -1753,13 +1990,10 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
      */
     subs_push(l, scratch, (int32_t)sizeof(scratch));
 
-    arm_accept(l);
-    arm_signal(l);
-    arm_timer(l);
     repl_dial(l);
     arm_conns(l);
     arm_stream(l);
-    return uring_submit(&l->ring, e, &submitted);
+    return RESULT_OK;
 }
 
 result_t loop_set_leader(loop_t *l, err_t *e, const sockaddr_in_t *addr,
@@ -1789,8 +2023,13 @@ result_t loop_set_leader(loop_t *l, err_t *e, const sockaddr_in_t *addr,
 
 void loop_set_signal_fd(loop_t *l, int32_t fd)
 {
+    err_t e;
+
+    err_init(&e);
     l->signal_fd = fd;
-    l->signal_pending = FALSE;
+    if (fd >= 0)
+        os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_ADD, fd, EPOLLIN,
+                     UD_MAKE(OP_SIGNAL, 0));
 }
 
 result_t loop_run(loop_t *l, err_t *e)
@@ -1839,7 +2078,10 @@ void loop_shutdown(loop_t *l)
         os_close(&e, l->signal_fd);
         l->signal_fd = -1;
     }
-    uring_destroy(&l->ring);
+    if (l->epoll_fd >= 0) {
+        os_close(&e, l->epoll_fd);
+        l->epoll_fd = -1;
+    }
 }
 
 int32_t loop_live_conns(const loop_t *l)
