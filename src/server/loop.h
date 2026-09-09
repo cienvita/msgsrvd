@@ -68,6 +68,46 @@
 #define LOOP_SUB_DEADLINE_TICKS  5      /* about half a second */
 
 /*
+ * Scrapes.
+ *
+ * The metrics endpoint has its own listener and its own slots. A
+ * scraper and a client have nothing to say to each other, and a stuck
+ * scrape must not be able to take a slot a client needs, so the two
+ * never share a pool.
+ *
+ * The request cap is what a request head is allowed to be before the
+ * connection is dropped unanswered. Nothing in it is read, so the cap
+ * is not about parsing cost: it is the point past which whatever is
+ * connecting is not a scraper.
+ */
+#define LOOP_MAX_SCRAPES    4
+#define LOOP_SCRAPE_CAP     4096
+#define LOOP_METRICS_CAP    16384
+
+/*
+ * Flush latency buckets, in nanoseconds, as Prometheus wants them:
+ * upper bounds, counted cumulatively at render time.
+ *
+ * The range spans two orders of magnitude because flush latency does:
+ * a drive with a power-loss-protected cache answers in tens of
+ * microseconds and one without it in milliseconds. Buckets that
+ * covered only one of those would put every sample in the first or the
+ * last, which measures nothing.
+ */
+#define LOOP_FSYNC_BUCKETS  7
+
+/* Refusals, grouped by the reason the client was given. */
+enum {
+    LOOP_REFUSED_NOT_LEADER = 0,
+    LOOP_REFUSED_NO_REPLICAS,
+    LOOP_REFUSED_BEHIND,
+    LOOP_REFUSED_NO_HISTORY,
+    LOOP_REFUSED_STORAGE,
+    LOOP_REFUSED_OTHER,
+    LOOP_REFUSED_KINDS
+};
+
+/*
  * An acknowledgement owed to a client.
  *
  * There are two per connection because the levels are answered
@@ -123,6 +163,23 @@ typedef struct {
     bool_t      closing;
     uint8_t     _pad[5];
 } loop_conn_t;
+
+/*
+ * A scrape in progress.
+ *
+ * The response is built when the request ends and lives here until it
+ * has gone, because a socket that will not take all of it has to be
+ * finished on a later pass.
+ */
+typedef struct {
+    int32_t     fd;             /* -1 when the slot is free */
+    int32_t     in_len;         /* request bytes seen so far */
+    int32_t     out_len;        /* response bytes built */
+    int32_t     sent;           /* response bytes gone */
+    bool_t      answering;      /* watching for writability, not readability */
+    uint8_t     _pad[3];
+    uint64_t    opened_ns;      /* when it arrived, for picking the oldest */
+} loop_scrape_t;
 
 typedef struct {
     int32_t         epoll_fd;
@@ -190,6 +247,27 @@ typedef struct {
     uint64_t        peer_durable[LOOP_MAX_REPLICAS];
     wal_cursor_t    peer_cursor[LOOP_MAX_REPLICAS];
 
+    /*
+     * Retention.
+     *
+     * Two limits and the lower wins: a count of segments, which is
+     * what bounds disk use and the recovery scan, and on a leader the
+     * sequence every configured replica has confirmed, which is what
+     * stops a record being deleted before the replicas that are meant
+     * to hold it have got it.
+     */
+    int32_t         retain_segments;    /* 0 keeps everything */
+    int32_t         replicas_want;      /* replicas that gate the delete */
+    uint64_t        retain_floor;       /* what they have all confirmed */
+    int32_t         retain_seen_segs;   /* segments at the last attempt */
+    bool_t          retain_failed;      /* an unlink failed; wait to retry */
+    uint8_t         _pad6[3];
+
+    /* Metrics: a second listener, and the scrapes on it. */
+    int32_t         metrics_fd;         /* -1 when the endpoint is off */
+    int32_t         metrics_port;       /* host byte order, after binding */
+    loop_scrape_t   scrapes[LOOP_MAX_SCRAPES];
+
     /* Counters, for the metrics endpoint and for tests */
     uint64_t        accepted;
     uint64_t        closed;
@@ -199,6 +277,30 @@ typedef struct {
     uint64_t        repl_records;   /* records streamed, or applied */
     uint64_t        repl_degraded;  /* writes acknowledged without a copy */
     uint64_t        notified;       /* records pushed to subscribers */
+    uint64_t        retain_removed; /* segments deleted */
+    uint64_t        retain_errors;  /* deletes that failed */
+    uint64_t        scrapes_served;
+    uint64_t        scrapes_refused;
+
+    /*
+     * Acknowledgements by the level they answered, counted where they
+     * are sent rather than where they are asked for: what a client was
+     * promised is what it was told, and a degraded one was told less
+     * than it asked.
+     */
+    uint64_t        acks_append;
+    uint64_t        acks_sync;
+    uint64_t        acks_repl;
+
+    /* Refusals by the reason given. */
+    uint64_t        refused[LOOP_REFUSED_KINDS];
+
+    /* Flush latency. The count is flushes above. */
+    uint64_t        fsync_ns_total;
+    uint64_t        fsync_bucket[LOOP_FSYNC_BUCKETS + 1];
+
+    /* Leader: when each replica last said how far it had got. */
+    uint64_t        peer_ack_ns[LOOP_MAX_REPLICAS];
 } loop_t;
 
 /*
@@ -263,5 +365,41 @@ void loop_send_done(loop_t *l, int32_t slot, int32_t res);
 
 /* Connections currently occupying a slot. */
 int32_t loop_live_conns(const loop_t *l);
+
+/*
+ * Keep at most keep_segments segments, deleting older ones once
+ * replicas of them are no longer needed. 0 keeps everything, which is
+ * what a node that was given no retention does.
+ *
+ * replicas is how many replicas the node expects to have. Deleting
+ * waits for that many to be attached and to have confirmed past what
+ * is going, so a replica that is away holds the log where it is. On a
+ * follower, and on a leader that expects none, only the count applies.
+ */
+void loop_set_retention(loop_t *l, int32_t keep_segments, int32_t replicas);
+
+/*
+ * Serve metrics on a second listener, port 0 asking the kernel to
+ * choose one as loop_init does. Not calling this at all is what
+ * leaves the endpoint off, which is the default.
+ *
+ * Separate from the data port because what it serves is a different
+ * thing to a different reader, and the two want different access: a
+ * scrape describes the node to whoever operates it, and nothing that
+ * writes records has any business asking.
+ */
+result_t loop_set_metrics_port(loop_t *l, err_t *e, uint32_t bind_ip,
+                               uint16_t port);
+
+/*
+ * Build the metrics document into buf. Returns the bytes written, or
+ * 0 if it would not fit, which is also what the endpoint does with it:
+ * a truncated document is a valid shorter one and would be scraped as
+ * if the missing metrics had never existed.
+ *
+ * Not static because the self-check reads it directly, which is the
+ * only way to compare a rendered value against the state it came from.
+ */
+int32_t loop_metrics(loop_t *l, char *buf, int32_t cap);
 
 #endif /* MSGSRVD_LOOP_H */

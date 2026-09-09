@@ -1412,35 +1412,51 @@ int selfcheck_sessions(void)
     static session_table_t t;
     session_t             *a;
     session_t             *b;
+    uint64_t               a_id;
+    uint64_t               b_id;
     int32_t                i;
 
     session_table_init(&t);
-    if (t.count != 0 || t.next_id != 1) {
+    if (t.count != 0) {
         DBG_LOG("sessions: fresh table wrong");
         return 1;
     }
 
     a = session_create(&t);
     b = session_create(&t);
-    if (!a || !b || a->id != 1 || b->id != 2 ||
+    if (!a || !b || a->id == 0 || b->id == 0 || a->id == b->id ||
         a->last_client_seq != 0 || t.count != 2) {
-        DBG_LOG("sessions: ids not issued in order");
+        DBG_LOG("sessions: two sessions did not get two ids");
+        return 1;
+    }
+    a_id = a->id;
+    b_id = b->id;
+
+    /*
+     * Drawn, not counted. A table that hands out the numbers one and
+     * two is a table whose ids can be guessed and, worse, reissued
+     * after retention has taken the records that would have shown they
+     * were used.
+     */
+    if (a_id <= (uint64_t)SESSION_MAX || b_id <= (uint64_t)SESSION_MAX) {
+        DBG_LOG("sessions: an id looks counted rather than drawn");
         return 1;
     }
 
-    if (session_lookup(&t, 1) != a || session_lookup(&t, 2) != b ||
-        session_lookup(&t, 0) != NULL || session_lookup(&t, 99) != NULL) {
+    if (session_lookup(&t, a_id) != a || session_lookup(&t, b_id) != b ||
+        session_lookup(&t, 0) != NULL ||
+        session_lookup(&t, a_id ^ 1) != NULL) {
         DBG_LOG("sessions: lookup wrong");
         return 1;
     }
 
     /* A high-water mark rises and never falls */
-    session_observe(&t, 1, 5);
+    session_observe(&t, a_id, 5);
     if (a->last_client_seq != 5) {
         DBG_LOG("sessions: observe did not raise the mark");
         return 1;
     }
-    session_observe(&t, 1, 3);
+    session_observe(&t, a_id, 3);
     if (a->last_client_seq != 5) {
         DBG_LOG("sessions: observe lowered the mark");
         return 1;
@@ -1455,25 +1471,26 @@ int selfcheck_sessions(void)
     }
 
     /*
-     * The one that matters. An id seen in the log has to push the
-     * counter past it, or the next client is handed an identity that
-     * already has records and a high-water mark, and its first write
-     * is discarded as a duplicate of a stranger's.
+     * The one that matters, and the reason for drawing rather than
+     * counting: a new session must not land on an id the log already
+     * has records under, or its first write is measured against a
+     * stranger's high-water mark and discarded as a duplicate. Run
+     * enough times that a table handing out anything predictable
+     * collides with one of the ids already in it.
      */
-    session_observe(&t, 500, 9);
-    if (t.next_id <= 500) {
-        DBG_LOG("sessions: next id did not clear a recovered id");
-        return 1;
-    }
-    {
+    for (i = 0; i < 512; i++) {
         session_t *fresh = session_create(&t);
 
-        if (!fresh || fresh->id <= 500) {
-            DBG_LOG("sessions: new session reused a recovered id");
+        if (!fresh || fresh->id == 0) {
+            DBG_LOG("sessions: no id was drawn");
             return 1;
         }
         if (fresh->last_client_seq != 0) {
             DBG_LOG("sessions: new session inherited a high-water mark");
+            return 1;
+        }
+        if (fresh->id == a_id || fresh->id == b_id || fresh->id == 7) {
+            DBG_LOG("sessions: a draw landed on an id already in use");
             return 1;
         }
     }
@@ -1489,72 +1506,115 @@ int selfcheck_sessions(void)
         }
     }
 
-    /* Filling the table drops the oldest, and ids keep climbing */
+    /*
+     * Filling the table, then overflowing it twice.
+     *
+     * Twice, because the first eviction is the one case where being
+     * wrong about age looks right: the session created first is also
+     * in the first slot, so a table that always took slot zero would
+     * pass. After that eviction slot zero holds the newest session
+     * there is, and the second overflow has to leave it alone and take
+     * the one created second.
+     */
     session_table_init(&t);
-    for (i = 0; i < SESSION_MAX; i++)
-        session_create(&t);
+    for (i = 0; i < SESSION_MAX; i++) {
+        session_t *made = session_create(&t);
+
+        if (!made) {
+            DBG_LOG("sessions: could not fill the table");
+            return 1;
+        }
+        if (i == 0)
+            a_id = made->id;
+        if (i == 1)
+            b_id = made->id;
+    }
     if (t.count != SESSION_MAX || t.evicted != 0) {
         DBG_LOG("sessions: table did not fill cleanly");
         return 1;
     }
+
+    /*
+     * Give the session about to go a mark, or the slot it leaves
+     * behind is already zero and reusing it without clearing looks the
+     * same as clearing it. Written onto the entry rather than through
+     * session_observe, which would count as having seen it and move it
+     * out of the way of the eviction under test.
+     */
+    session_lookup(&t, a_id)->last_client_seq = 77;
     {
-        uint64_t   next;
-        session_t *extra;
+        session_t *first = session_create(&t);
+        session_t *second;
 
-        /*
-         * Give the session about to be evicted a mark, or the slot it
-         * leaves behind is already zero and reusing it without
-         * clearing looks the same as clearing it.
-         */
-        session_observe(&t, 1, 77);
-        next = t.next_id;
-        extra = session_create(&t);
-
-        if (!extra || extra->id != next || t.count != SESSION_MAX ||
-            t.evicted != 1) {
-            DBG_LOG("sessions: overflow did not evict exactly one");
+        if (!first || t.count != SESSION_MAX || t.evicted != 1) {
+            DBG_LOG("sessions: the first overflow did not evict exactly one");
+            return 1;
+        }
+        if (session_lookup(&t, a_id) != NULL) {
+            DBG_LOG("sessions: the first overflow kept the oldest");
             return 1;
         }
         /* The slot is reused; what was in it must not carry over */
-        if (extra->last_client_seq != 0) {
+        if (first->last_client_seq != 0) {
             DBG_LOG("sessions: reused slot kept the old high-water mark");
             return 1;
         }
-        if (session_lookup(&t, 1) != NULL) {
-            DBG_LOG("sessions: overflow kept the oldest session");
+
+        second = session_create(&t);
+        if (!second || t.evicted != 2) {
+            DBG_LOG("sessions: the second overflow did not evict one");
+            return 1;
+        }
+        if (session_lookup(&t, b_id) != NULL) {
+            DBG_LOG("sessions: the second overflow took the wrong session");
+            return 1;
+        }
+        if (session_lookup(&t, first->id) == NULL) {
+            DBG_LOG("sessions: the newest session was evicted");
             return 1;
         }
     }
 
     /*
-     * On a full table an id older than everything held is dropped
-     * rather than allowed to push out a newer one. Filled from a range
-     * that starts well above zero, so there is room for an id below
-     * all of them that is genuinely absent.
+     * Age is arrival, not the id. Recovery walks the log forward, so a
+     * session met later is the more recent one whatever its id says,
+     * and on a full table it is the one that stays. An id cannot be
+     * asked about this any more: the numbers below are deliberately
+     * descending, so a table still comparing them would keep the wrong
+     * ones.
      */
     {
-        uint64_t before_next;
-
         session_table_init(&t);
         for (i = 0; i < SESSION_MAX; i++)
-            session_observe(&t, (uint64_t)(100 + i), 1);
-        if (t.count != SESSION_MAX || session_lookup(&t, 100) == NULL) {
+            session_observe(&t, (uint64_t)(100000 - i), 1);
+        if (t.count != SESSION_MAX ||
+            session_lookup(&t, 100000) == NULL ||
+            session_lookup(&t, (uint64_t)(100000 - SESSION_MAX + 1)) == NULL) {
             DBG_LOG("sessions: fill by observation wrong");
             return 1;
         }
 
-        before_next = t.next_id;
-        session_observe(&t, 50, 1);
-        if (session_lookup(&t, 50) != NULL) {
-            DBG_LOG("sessions: an older id was admitted to a full table");
+        /* The first one met is the first to go. */
+        session_observe(&t, 42, 1);
+        if (session_lookup(&t, 42) == NULL) {
+            DBG_LOG("sessions: a session met later was refused a slot");
             return 1;
         }
-        if (session_lookup(&t, 100) == NULL) {
-            DBG_LOG("sessions: an older id displaced a newer one");
+        if (session_lookup(&t, 100000) != NULL) {
+            DBG_LOG("sessions: the least recently seen was not the one to go");
             return 1;
         }
-        if (t.next_id != before_next) {
-            DBG_LOG("sessions: an older id moved the counter");
+        if (t.evicted != 1) {
+            DBG_LOG("sessions: evicted %d making room for one",
+                    (int32_t)t.evicted);
+            return 1;
+        }
+
+        /* Writing to a session is being seen, so it stops being next. */
+        session_observe(&t, (uint64_t)(100000 - 1), 2);
+        session_observe(&t, 43, 1);
+        if (session_lookup(&t, (uint64_t)(100000 - 1)) == NULL) {
+            DBG_LOG("sessions: a session written to was still evicted");
             return 1;
         }
     }
@@ -2398,11 +2458,25 @@ int selfcheck_session_recovery(void)
             tmp_dir_destroy(dir);
             return 1;
         }
-        if (sessions.next_id <= session) {
-            DBG_LOG("session recovery: next id would reuse the old one");
-            wal_close(&w, &e);
-            tmp_dir_destroy(dir);
-            return 1;
+        /*
+         * And a fresh session cannot land on the recovered one. The id
+         * is drawn, so this says the draw is checked against what
+         * recovery put in the table rather than that a counter cleared
+         * it.
+         */
+        {
+            int32_t k;
+
+            for (k = 0; k < 64; k++) {
+                session_t *fresh = session_create(&sessions);
+
+                if (!fresh || fresh->id == session) {
+                    DBG_LOG("session recovery: a new id reused the old one");
+                    wal_close(&w, &e);
+                    tmp_dir_destroy(dir);
+                    return 1;
+                }
+            }
         }
     }
 
@@ -3869,6 +3943,947 @@ out_dirs:
     return rc;
 }
 
+/* ---- retention ---- */
+
+/* Turn the loop over enough times for a retention pass to have run. */
+static void retain_settle(loop_t *l, err_t *e)
+{
+    int32_t i;
+
+    for (i = 0; i < 8; i++)
+        loop_tick(l, e, FALSE);
+}
+
+/* Segment files present, counted from the directory rather than the table. */
+static int32_t retain_files(const char *path)
+{
+    static uint8_t dbuf[4096];
+    err_t          e;
+    int32_t        fd = -1;
+    int32_t        n = 0;
+    int32_t        got = 0;
+
+    err_init(&e);
+    if (!result_ok(os_open(&e, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0,
+                           &fd)))
+        return -1;
+
+    while (result_ok(os_getdents64(&e, fd, dbuf, (int32_t)sizeof(dbuf),
+                                   &got)) && got > 0) {
+        int32_t at = 0;
+
+        while (at < got) {
+            uint16_t reclen = 0;
+
+            mem_copy((uint8_t *)&reclen, dbuf + at + DIRENT64_RECLEN_OFF, 2);
+            if (reclen == 0)
+                break;
+            if (dbuf[at + DIRENT64_NAME_OFF] != '.')
+                n++;
+            at += reclen;
+        }
+    }
+
+    os_close(&e, fd);
+    return n;
+}
+
+int selfcheck_retention(void)
+{
+    static uint8_t  scratch[4096];
+    static uint8_t  payload[64];
+    static char     dir[64];
+    err_t           e;
+    wal_t           w;
+    wal_open_t      info;
+    loop_t          l;
+    session_table_t sessions;
+    wal_cursor_t    cur;
+    int32_t         rec_size = wal_rec_size(24);
+    int64_t         cap = (int64_t)(rec_size * 3);  /* three records each */
+    int32_t         rc = 1;
+    int32_t         got = 0;
+
+    err_init(&e);
+    mem_set(payload, 0x5A, (int32_t)sizeof(payload));
+    seg_tmp_path(dir, 11);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("retention: mkdir failed");
+        return 1;
+    }
+
+    if (!result_ok(wal_open(&w, &e, dir, cap, scratch,
+                            (int32_t)sizeof(scratch), &info, NULL, NULL))) {
+        DBG_LOG("retention: wal open failed");
+        goto out_dir;
+    }
+
+    session_table_init(&sessions);
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
+        DBG_LOG("retention: loop unavailable, skipping");
+        rc = 0;
+        goto out_wal;
+    }
+
+    /*
+     * Fifteen records at three to a segment: five segments, the last
+     * of them active. Keeping two should take the other three.
+     */
+    if (!result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 15))) {
+        DBG_LOG("retention: appends failed");
+        goto out_loop;
+    }
+    if (wal_segments(&w) != 5) {
+        DBG_LOG("retention: expected five segments, found %d",
+                wal_segments(&w));
+        goto out_loop;
+    }
+
+    /* Nothing configured, so nothing goes. */
+    retain_settle(&l, &e);
+    if (wal_segments(&w) != 5 || l.retain_removed != 0) {
+        DBG_LOG("retention: deleted with retention off");
+        goto out_loop;
+    }
+
+    /*
+     * A reader parked at the end of a segment that is about to go.
+     * This is the shape the stall needs: the descriptor stays valid
+     * because the file is only unlinked, the records it has left are
+     * the preallocated zeros that mean unwritten space, and the
+     * segment holding what comes next is no longer in the table. What
+     * that adds up to, without something saying otherwise, is a read
+     * that returns nothing and looks exactly like having caught up.
+     */
+    wal_cursor_init(&cur);
+    if (!result_ok(wal_cursor_seek(&w, &e, &cur, 4, scratch,
+                                   (int32_t)sizeof(scratch)))) {
+        DBG_LOG("retention: cannot seek a reader into the second segment");
+        goto out_loop;
+    }
+    if (!result_ok(wal_cursor_read(&w, &e, &cur, 6, scratch,
+                                   (int32_t)sizeof(scratch), &got)) ||
+        got == 0 || cur.next_seq != 7) {
+        DBG_LOG("retention: the reader stopped at %d after %d bytes",
+                (int32_t)cur.next_seq, got);
+        goto out_loop;
+    }
+
+    loop_set_retention(&l, 2, 0);
+    retain_settle(&l, &e);
+
+    if (wal_segments(&w) != 2) {
+        DBG_LOG("retention: %d segments left, wanted two", wal_segments(&w));
+        goto out_loop;
+    }
+    if (l.retain_removed != 3 || l.retain_errors != 0) {
+        DBG_LOG("retention: removed %d, errors %d",
+                (int32_t)l.retain_removed, (int32_t)l.retain_errors);
+        goto out_loop;
+    }
+    if (wal_first_seq(&w) != 10) {
+        DBG_LOG("retention: first sequence is %d, wanted ten",
+                (int32_t)wal_first_seq(&w));
+        goto out_loop;
+    }
+
+    /* The table and the directory agree: the files are actually gone. */
+    if (retain_files(dir) != 2) {
+        DBG_LOG("retention: %d files on disk, wanted two", retain_files(dir));
+        goto out_loop;
+    }
+
+    /* A second pass has nothing left to do. */
+    retain_settle(&l, &e);
+    if (l.retain_removed != 3) {
+        DBG_LOG("retention: removed more on a second pass");
+        goto out_loop;
+    }
+
+    /*
+     * The reader parked earlier now stands below the log. It has to be
+     * told, because the alternative it would otherwise get is silence,
+     * and silence here means caught up.
+     */
+    got = -1;
+    if (result_ok(wal_cursor_read(&w, &e, &cur, 15, scratch,
+                                  (int32_t)sizeof(scratch), &got))) {
+        DBG_LOG("retention: a reader below the log was given %d bytes", got);
+        wal_cursor_close(&cur, &e);
+        goto out_loop;
+    }
+    wal_cursor_close(&cur, &e);
+
+    /* Seeking there is refused too, which is what a replica meets. */
+    wal_cursor_init(&cur);
+    if (result_ok(wal_cursor_seek(&w, &e, &cur, 1, scratch,
+                                  (int32_t)sizeof(scratch)))) {
+        DBG_LOG("retention: seek to a deleted sequence was allowed");
+        wal_cursor_close(&cur, &e);
+        goto out_loop;
+    }
+
+    /*
+     * What a subscriber left behind by retention is told. The cursor is
+     * put back by hand because filling a socket until a real reader
+     * stalls would make the check depend on the kernel's buffer sizes;
+     * the state it stands in is the one retention leaves.
+     */
+    {
+        int32_t  fd = loop_client_connect(l.port);
+        uint64_t session = 0;
+        uint64_t high = 0;
+        uint8_t  sbuf[256];
+        msg_subscribe_t req;
+        msg_header_t    h;
+        int32_t         plen = 0;
+        int32_t         i;
+        int32_t         slot = -1;
+        bool_t          told = FALSE;
+
+        if (fd < 0 || !loop_hello(fd, &l, &e, 0, &session, &high)) {
+            DBG_LOG("retention: subscriber hello failed");
+            goto out_loop;
+        }
+
+        req.from_seq = 10;
+        req.min_seq = 0;
+        msg_encode_subscribe(sbuf, (int32_t)sizeof(sbuf), &req);
+        if (!loop_send_frame(fd, MSG_OP_SUBSCRIBE, MSG_FLAG_ALL_KEYS, 0, 1,
+                             sbuf, MSG_SUBSCRIBE_SIZE)) {
+            DBG_LOG("retention: subscribe failed to send");
+            goto out_loop;
+        }
+        loop_settle(&l, &e);
+
+        for (i = 0; i < LOOP_MAX_CONNS; i++) {
+            if (l.conns[i].in_use && l.conns[i].sub.active)
+                slot = i;
+        }
+        if (slot < 0) {
+            DBG_LOG("retention: the subscription did not start");
+            goto out_loop;
+        }
+        l.conns[slot].sub.cursor.next_seq = 4;
+        loop_settle(&l, &e);
+
+        while (loop_read_frame(fd, sbuf, (int32_t)sizeof(sbuf), &h, &plen)) {
+            msg_err_payload_t ep;
+
+            if (h.op != MSG_OP_ERR)
+                continue;
+            if (msg_decode_err(sbuf + MSG_HEADER_SIZE, plen, &ep) &&
+                ep.code == MSG_ERR_NO_HISTORY)
+                told = TRUE;
+            break;
+        }
+        loop_read_forget(fd);
+        os_close(&e, fd);
+
+        if (!told) {
+            DBG_LOG("retention: a stranded subscriber was not told why");
+            goto out_loop;
+        }
+    }
+
+    loop_shutdown(&l);
+    if (!result_ok(wal_close(&w, &e))) {
+        DBG_LOG("retention: close failed");
+        goto out_dir;
+    }
+
+    /*
+     * Recovery of a log that starts above one. The scan has to accept a
+     * first segment whose base is not the first sequence ever written,
+     * which is the whole of what retention leaves behind.
+     */
+    if (!result_ok(wal_open(&w, &e, dir, cap, scratch,
+                            (int32_t)sizeof(scratch), &info, NULL, NULL))) {
+        DBG_LOG("retention: reopen after retention failed");
+        goto out_dir;
+    }
+    if (info.first_seq != 10 || info.last_seq != 15 || info.torn ||
+        info.segments != 2) {
+        DBG_LOG("retention: reopened at %d..%d over %d segments",
+                (int32_t)info.first_seq, (int32_t)info.last_seq,
+                info.segments);
+        wal_close(&w, &e);
+        goto out_dir;
+    }
+
+    wal_close(&w, &e);
+    rc = 0;
+    goto out_dir;
+
+out_loop:
+    loop_shutdown(&l);
+out_wal:
+    wal_close(&w, &e);
+out_dir:
+    tmp_dir_destroy(dir);
+    return rc;
+}
+
+/*
+ * A session forgotten by retention must not have its id handed out
+ * again.
+ *
+ * The table is counted out of the log, and so was the next id to
+ * issue, back when there was one. Retention broke that: a session
+ * whose records are all deleted is never seen by the scan, so a
+ * counter restarting from what it can see would reissue the id and
+ * measure a new client's first write against the forgotten session's
+ * high-water mark. The id is drawn now, which is what makes the
+ * question moot.
+ */
+int selfcheck_session_retention(void)
+{
+    static uint8_t         scratch[4096];
+    static uint8_t         payload[64];
+    static char            dir[64];
+    static session_table_t sessions;
+    const uint64_t         gone = 101;   /* records only in what is deleted */
+    const uint64_t         kept = 100;   /* records in what survives */
+    err_t                  e;
+    wal_t                  w;
+    wal_open_t             info;
+    wal_rec_t              rec;
+    int32_t                rec_size = wal_rec_size(24);
+    int64_t                cap = (int64_t)(rec_size * 3);
+    int32_t                removed = 0;
+    int32_t                rc = 1;
+    int32_t                i;
+
+    err_init(&e);
+    mem_set(payload, 0x5A, (int32_t)sizeof(payload));
+    seg_tmp_path(dir, 15);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("session retention: mkdir failed");
+        return 1;
+    }
+
+    if (!result_ok(wal_open(&w, &e, dir, cap, scratch,
+                            (int32_t)sizeof(scratch), &info, NULL, NULL))) {
+        DBG_LOG("session retention: wal open failed");
+        goto out_dir;
+    }
+
+    /*
+     * Nine records for the session that will be forgotten, then six
+     * for the one that stays. Three to a segment, so keeping two
+     * leaves sequences ten to fifteen and nothing of the first
+     * session at all.
+     */
+    for (i = 1; i <= 15; i++) {
+        seg_fill_rec(&rec, 24, (i <= 9) ? gone : kept, (uint64_t)i, 1);
+        if (!result_ok(wal_append(&w, &e, &rec, payload, scratch,
+                                  (int32_t)sizeof(scratch)))) {
+            DBG_LOG("session retention: append failed");
+            goto out_wal;
+        }
+    }
+    if (!result_ok(wal_sync(&w, &e))) {
+        DBG_LOG("session retention: flush failed");
+        goto out_wal;
+    }
+
+    if (!result_ok(wal_retain(&w, &e, wal_retain_mark(&w, 2), &removed)) ||
+        removed != 3 || wal_first_seq(&w) != 10) {
+        DBG_LOG("session retention: retention left the log at %d",
+                (int32_t)wal_first_seq(&w));
+        goto out_wal;
+    }
+    wal_close(&w, &e);
+
+    /* Recovery of what is left, which has never heard of the first. */
+    session_table_init(&sessions);
+    if (!result_ok(wal_open(&w, &e, dir, cap, scratch,
+                            (int32_t)sizeof(scratch), &info,
+                            session_from_record, &sessions))) {
+        DBG_LOG("session retention: reopen failed");
+        goto out_dir;
+    }
+    if (session_lookup(&sessions, kept) == NULL) {
+        DBG_LOG("session retention: the surviving session was not recovered");
+        goto out_wal;
+    }
+    if (session_lookup(&sessions, gone) != NULL) {
+        DBG_LOG("session retention: a deleted session came back");
+        goto out_wal;
+    }
+
+    /*
+     * Now the thing itself. Every id issued from here has to miss the
+     * forgotten one. A counter starting from what the scan could see
+     * would hand it out first.
+     */
+    for (i = 0; i < 256; i++) {
+        session_t *fresh = session_create(&sessions);
+
+        if (!fresh) {
+            DBG_LOG("session retention: no id was drawn");
+            goto out_wal;
+        }
+        if (fresh->id == gone) {
+            DBG_LOG("session retention: reissued the forgotten id after %d",
+                    i);
+            goto out_wal;
+        }
+        if (fresh->id == kept) {
+            DBG_LOG("session retention: issued an id the log still holds");
+            goto out_wal;
+        }
+    }
+
+    rc = 0;
+
+out_wal:
+    wal_close(&w, &e);
+out_dir:
+    tmp_dir_destroy(dir);
+    if (rc == 0)
+        DBG_LOG("session retention: a forgotten id is not issued again: ok");
+    return rc;
+}
+
+/*
+ * The mark a leader will not delete past, and what freezes it.
+ *
+ * A replica that is away is the case the rule exists for: what it has
+ * not got must stay on the leader, because a replica asking to stream
+ * from below the retained log cannot be repaired by streaming.
+ */
+int selfcheck_retention_replica(void)
+{
+    static uint8_t  scratch[8192];
+    static uint8_t  payload[64];
+    static char     ldir[64];
+    static char     fdir[64];
+    static const char leader_text[] = "127.0.0.1:1";
+    err_t           e;
+    wal_t           lw;
+    wal_t           fw;
+    wal_open_t      info;
+    loop_t          leader;
+    loop_t          follower;
+    session_table_t lsessions;
+    session_table_t fsessions;
+    sockaddr_in_t   addr;
+    uint64_t        frozen_at;
+    int32_t         rec_size = wal_rec_size(24);
+    int64_t         cap = (int64_t)(rec_size * 3);
+    int32_t         rc = 1;
+    bool_t          follower_up = FALSE;
+
+    err_init(&e);
+    mem_set(payload, 0x5A, (int32_t)sizeof(payload));
+    seg_tmp_path(ldir, 12);
+    seg_tmp_path(fdir, 13);
+    if (!result_ok(os_mkdir(&e, ldir, MODE_0700)) ||
+        !result_ok(os_mkdir(&e, fdir, MODE_0700))) {
+        DBG_LOG("retention/replica: mkdir failed");
+        return 1;
+    }
+
+    session_table_init(&lsessions);
+    session_table_init(&fsessions);
+
+    if (!result_ok(wal_open(&lw, &e, ldir, cap, scratch,
+                            (int32_t)sizeof(scratch), &info, NULL, NULL)) ||
+        !result_ok(wal_open(&fw, &e, fdir, cap, scratch,
+                            (int32_t)sizeof(scratch), &info, NULL, NULL))) {
+        DBG_LOG("retention/replica: wal open failed");
+        goto out_dirs;
+    }
+
+    if (!result_ok(loop_init(&leader, &e, &lw, &lsessions, 0x7F000001, 0))) {
+        DBG_LOG("retention/replica: loop unavailable, skipping");
+        rc = 0;
+        goto out_wal;
+    }
+    if (!result_ok(loop_init(&follower, &e, &fw, &fsessions, 0x7F000001,
+                             0))) {
+        DBG_LOG("retention/replica: second loop failed");
+        loop_shutdown(&leader);
+        goto out_wal;
+    }
+    follower_up = TRUE;
+
+    /*
+     * Two expected, one that will ever attach. A record is not on two
+     * nodes because one node says so, so the mark must not move at
+     * all while the set is short.
+     */
+    loop_set_retention(&leader, 2, 2);
+    loop_set_retention(&follower, 2, 0);
+
+    /* Five segments on the leader, with nobody to confirm them. */
+    if (!result_ok(wal_put(&lw, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 15))) {
+        DBG_LOG("retention/replica: appends failed");
+        goto out_loops;
+    }
+    retain_settle(&leader, &e);
+    if (wal_first_seq(&lw) != 1 || leader.retain_removed != 0) {
+        DBG_LOG("retention/replica: deleted before any replica confirmed");
+        goto out_loops;
+    }
+
+    mem_zero((uint8_t *)&addr, (int32_t)sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)leader.port);
+    addr.sin_addr = htonl(0x7F000001);
+
+    if (!result_ok(loop_set_leader(&follower, &e, &addr, leader_text))) {
+        DBG_LOG("retention/replica: the follower could not take a timer");
+        goto out_loops;
+    }
+    if (!repl_wait_attached(&leader, &follower, &e, TRUE) ||
+        !repl_wait_caught_up(&leader, &follower, &e, &lw, &fw)) {
+        DBG_LOG("retention/replica: the replica did not catch up");
+        goto out_loops;
+    }
+    repl_settle(&leader, &follower, &e, 16);
+
+    if (leader.retain_floor != 0 || leader.retain_removed != 0) {
+        DBG_LOG("retention/replica: one replica of two moved the mark to %d",
+                (int32_t)leader.retain_floor);
+        goto out_loops;
+    }
+
+    /*
+     * Told to expect the one that is here, the mark follows it. The
+     * count is unchanged, so what moves is only what the replicas are
+     * allowed to release.
+     */
+    loop_set_retention(&leader, 2, 1);
+    if (!result_ok(wal_put(&lw, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 3))) {
+        DBG_LOG("retention/replica: appends failed");
+        goto out_loops;
+    }
+    if (!repl_wait_caught_up(&leader, &follower, &e, &lw, &fw)) {
+        DBG_LOG("retention/replica: the replica did not take the rest");
+        goto out_loops;
+    }
+    repl_settle(&leader, &follower, &e, 16);
+
+    if (leader.retain_floor != 18) {
+        DBG_LOG("retention/replica: floor at %d, wanted eighteen",
+                (int32_t)leader.retain_floor);
+        goto out_loops;
+    }
+    if (wal_first_seq(&lw) != 13 || leader.retain_removed != 4) {
+        DBG_LOG("retention/replica: kept %d after the replica confirmed",
+                (int32_t)wal_first_seq(&lw));
+        goto out_loops;
+    }
+
+    /* The replica keeps its own count, with nobody downstream of it. */
+    if (wal_first_seq(&fw) != 13) {
+        DBG_LOG("retention/replica: the replica kept %d",
+                (int32_t)wal_first_seq(&fw));
+        goto out_loops;
+    }
+
+    /* Now take it away and write past two more rollovers. */
+    loop_shutdown(&follower);
+    follower_up = FALSE;
+    if (!repl_wait_attached(&leader, &leader, &e, FALSE)) {
+        DBG_LOG("retention/replica: the leader did not notice it go");
+        goto out_loops;
+    }
+
+    frozen_at = leader.retain_floor;
+    if (!result_ok(wal_put(&lw, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 12))) {
+        DBG_LOG("retention/replica: appends after the replica left failed");
+        goto out_loops;
+    }
+    retain_settle(&leader, &e);
+
+    /*
+     * The mark is where the replica left it, so what it confirmed can
+     * still go and nothing above that can. A replica coming back asks
+     * for the sequence after the one it last confirmed, and this is
+     * what leaves that sequence on disk for it to be sent.
+     */
+    if (leader.retain_floor != frozen_at) {
+        DBG_LOG("retention/replica: the mark moved with the replica away");
+        goto out_loops;
+    }
+    if (wal_first_seq(&lw) > frozen_at + 1) {
+        DBG_LOG("retention/replica: deleted to %d, past the confirmed %d",
+                (int32_t)wal_first_seq(&lw), (int32_t)frozen_at);
+        goto out_loops;
+    }
+
+    /*
+     * And the count alone would have gone further, which is what makes
+     * the check above worth making: without the mark these segments
+     * would be gone.
+     */
+    if (wal_retain_mark(&lw, 2) <= wal_first_seq(&lw)) {
+        DBG_LOG("retention/replica: the count would not have deleted more");
+        goto out_loops;
+    }
+    if (wal_segments(&lw) <= 2) {
+        DBG_LOG("retention/replica: the log did not grow while held back");
+        goto out_loops;
+    }
+
+    rc = 0;
+
+out_loops:
+    if (follower_up)
+        loop_shutdown(&follower);
+    loop_shutdown(&leader);
+out_wal:
+    wal_close(&lw, &e);
+    wal_close(&fw, &e);
+out_dirs:
+    tmp_dir_destroy(ldir);
+    tmp_dir_destroy(fdir);
+    return rc;
+}
+
+/* ---- metrics ---- */
+
+/* Offset of needle in hay, or -1. */
+static int32_t sc_find(const char *hay, int32_t hay_len, const char *needle)
+{
+    int32_t n = 0;
+    int32_t i;
+
+    while (needle[n] != '\0')
+        n++;
+    if (n == 0 || n > hay_len)
+        return -1;
+
+    for (i = 0; i + n <= hay_len; i++) {
+        if (mem_cmp((const uint8_t *)hay + i, (const uint8_t *)needle, n) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* The decimal starting at off, or a miss reported as the sentinel. */
+static uint64_t sc_number_at(const char *s, int32_t len, int32_t off)
+{
+    uint64_t v = 0;
+    bool_t   any = FALSE;
+
+    while (off < len && s[off] >= '0' && s[off] <= '9') {
+        v = v * 10 + (uint64_t)(s[off] - '0');
+        any = TRUE;
+        off++;
+    }
+    return any ? v : (uint64_t)0xFFFFFFFFFFFFFFFFULL;
+}
+
+/* The value of a whole-line metric, or the sentinel if it is not there. */
+static uint64_t sc_metric(const char *body, int32_t len, const char *name)
+{
+    int32_t at = sc_find(body, len, name);
+    int32_t n = 0;
+
+    if (at < 0)
+        return (uint64_t)0xFFFFFFFFFFFFFFFFULL;
+    while (name[n] != '\0')
+        n++;
+    return sc_number_at(body, len, at + n);
+}
+
+/* Ask the endpoint once and return what it said. */
+static int32_t sc_scrape(loop_t *l, err_t *e, const char *request,
+                         int32_t req_len, char *out, int32_t cap)
+{
+    int32_t fd = loop_client_connect(l->metrics_port);
+    int32_t at = 0;
+    int32_t rounds;
+
+    if (fd < 0)
+        return -1;
+    loop_read_forget(fd);
+
+    if (os_write_raw(fd, request, (size_t)req_len) != (ssize_t)req_len) {
+        os_close(e, fd);
+        return -1;
+    }
+    /*
+     * Bounded, and the receive never blocks. An endpoint that decides
+     * not to answer is a case under test here, and a blocking read
+     * would turn it into a self-check that hangs rather than one that
+     * reports what it found.
+     */
+    for (rounds = 0; rounds < 64 && at < cap; rounds++) {
+        int32_t res = 0;
+
+        loop_settle(l, e);
+        os_recv(fd, (uint8_t *)out + at, cap - at, MSG_DONTWAIT, &res);
+        if (res == -EAGAIN)
+            continue;
+        if (res <= 0)
+            break;              /* closed, which is how every answer ends */
+        at += res;
+    }
+
+    os_close(e, fd);
+    return at;
+}
+
+int selfcheck_metrics(void)
+{
+    static uint8_t  scratch[4096];
+    static uint8_t  payload[64];
+    static char     dir[64];
+    static char     body[LOOP_METRICS_CAP * 2];
+    static char     junk[5000];
+    err_t           e;
+    wal_t           w;
+    wal_open_t      info;
+    loop_t          l;
+    session_table_t sessions;
+    int32_t         rc = 1;
+    int32_t         n;
+
+    err_init(&e);
+    mem_set(payload, 0x5A, (int32_t)sizeof(payload));
+    seg_tmp_path(dir, 14);
+    if (!result_ok(os_mkdir(&e, dir, MODE_0700))) {
+        DBG_LOG("metrics: mkdir failed");
+        return 1;
+    }
+
+    if (!result_ok(wal_open(&w, &e, dir, 65536, scratch,
+                            (int32_t)sizeof(scratch), &info, NULL, NULL))) {
+        DBG_LOG("metrics: wal open failed");
+        goto out_dir;
+    }
+
+    session_table_init(&sessions);
+    if (!result_ok(loop_init(&l, &e, &w, &sessions, 0x7F000001, 0))) {
+        DBG_LOG("metrics: loop unavailable, skipping");
+        rc = 0;
+        goto out_wal;
+    }
+
+    if (!result_ok(loop_set_metrics_port(&l, &e, 0x7F000001, 0))) {
+        DBG_LOG("metrics: could not listen");
+        goto out_loop;
+    }
+    if (l.metrics_port <= 0) {
+        DBG_LOG("metrics: no port reported");
+        goto out_loop;
+    }
+
+    if (!result_ok(wal_put(&w, &e, scratch, (int32_t)sizeof(scratch),
+                           payload, 4))) {
+        DBG_LOG("metrics: appends failed");
+        goto out_loop;
+    }
+
+    n = sc_scrape(&l, &e, "GET /metrics HTTP/1.0\r\n\r\n", 25, body,
+                  (int32_t)sizeof(body));
+    if (n <= 0) {
+        DBG_LOG("metrics: the endpoint said nothing");
+        goto out_loop;
+    }
+    if (sc_find(body, n, "HTTP/1.0 200 OK\r\n") != 0) {
+        DBG_LOG("metrics: no 200 in the answer");
+        goto out_loop;
+    }
+    if (sc_find(body, n, "Content-Type: text/plain; version=0.0.4") < 0) {
+        DBG_LOG("metrics: wrong content type");
+        goto out_loop;
+    }
+
+    /*
+     * A rendered value against the state it came from. Comparing the
+     * shape of the document would pass on a formatter that printed the
+     * same wrong number every time.
+     */
+    if (sc_metric(body, n, "\nmsgsrvd_durable_seq ") != wal_durable_seq(&w)) {
+        DBG_LOG("metrics: durable sequence rendered as %d, log says %d",
+                (int32_t)sc_metric(body, n, "\nmsgsrvd_durable_seq "),
+                (int32_t)wal_durable_seq(&w));
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "\nmsgsrvd_first_seq ") != wal_first_seq(&w) ||
+        sc_metric(body, n, "\nmsgsrvd_next_seq ") != wal_next_seq(&w) ||
+        sc_metric(body, n, "\nmsgsrvd_segments ") !=
+        (uint64_t)wal_segments(&w)) {
+        DBG_LOG("metrics: the log's own numbers do not match");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "\nmsgsrvd_role{role=\"leader\"} ") != 1 ||
+        sc_metric(body, n, "\nmsgsrvd_role{role=\"follower\"} ") != 0) {
+        DBG_LOG("metrics: the role is wrong");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "\nmsgsrvd_scrapes_total ") != 0) {
+        DBG_LOG("metrics: a scrape counted itself");
+        goto out_loop;
+    }
+
+    /* The one it just served is counted by the time the next one asks. */
+    n = sc_scrape(&l, &e, "GET / HTTP/1.0\n\n", 16, body,
+                  (int32_t)sizeof(body));
+    if (n <= 0 || sc_find(body, n, "HTTP/1.0 200 OK\r\n") != 0) {
+        DBG_LOG("metrics: bare newlines were not accepted");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "\nmsgsrvd_scrapes_total ") != 1) {
+        DBG_LOG("metrics: the first scrape was not counted");
+        goto out_loop;
+    }
+
+    /*
+     * A head longer than any request head has a reason to be is
+     * dropped without an answer. Describing the node to something that
+     * cannot ask properly is the thing to avoid.
+     */
+    mem_set((uint8_t *)junk, (uint8_t)'A', (int32_t)sizeof(junk));
+    n = sc_scrape(&l, &e, junk, (int32_t)sizeof(junk), body,
+                  (int32_t)sizeof(body));
+    if (n != 0) {
+        DBG_LOG("metrics: an oversized request got %d bytes back", n);
+        goto out_loop;
+    }
+    if (l.scrapes_refused == 0) {
+        DBG_LOG("metrics: the oversized request was not counted");
+        goto out_loop;
+    }
+
+    /*
+     * What a write and a refusal do to the counters. Both are read
+     * back through the endpoint rather than off the loop, so a
+     * formatter that dropped a label would show up here too.
+     */
+    {
+        int32_t  fd = loop_client_connect(l.port);
+        uint64_t session = 0;
+        uint64_t high = 0;
+
+        if (fd < 0 || !loop_hello(fd, &l, &e, 0, &session, &high)) {
+            DBG_LOG("metrics: client hello failed");
+            goto out_loop;
+        }
+        if (!loop_send_frame(fd, MSG_OP_WRITE,
+                             MSG_FLAG_ACK_REQ | MSG_FLAG_SYNC, 3, 1,
+                             (const uint8_t *)"x", 1)) {
+            DBG_LOG("metrics: write failed to send");
+            goto out_loop;
+        }
+        /* One that asked for no more than an append, so the two levels
+         * are told apart by what was asked and not by both being set. */
+        if (!loop_send_frame(fd, MSG_OP_WRITE, MSG_FLAG_ACK_REQ, 3, 2,
+                             (const uint8_t *)"y", 1)) {
+            DBG_LOG("metrics: second write failed to send");
+            goto out_loop;
+        }
+        /* DELETE is understood and refused, which is a refusal with no
+         * state of the node behind it: the "other" bucket. */
+        if (!loop_send_frame(fd, MSG_OP_DELETE, 0, 3, 3, NULL, 0)) {
+            DBG_LOG("metrics: delete failed to send");
+            goto out_loop;
+        }
+        loop_settle(&l, &e);
+        loop_read_forget(fd);
+        os_close(&e, fd);
+    }
+
+    n = sc_scrape(&l, &e, "GET / HTTP/1.0\r\n\r\n", 18, body,
+                  (int32_t)sizeof(body));
+    if (n <= 0) {
+        DBG_LOG("metrics: no answer after a write");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "\nmsgsrvd_writes_total ") != 2) {
+        DBG_LOG("metrics: the writes were not counted");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "durability=\"sync\"} ") != 1 ||
+        sc_metric(body, n, "durability=\"append\"} ") != 1 ||
+        sc_metric(body, n, "durability=\"replicated\"} ") != 0) {
+        DBG_LOG("metrics: the acknowledgements were counted at the wrong "
+                "level");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "reason=\"other\"} ") != 1 ||
+        sc_metric(body, n, "reason=\"storage\"} ") != 0) {
+        DBG_LOG("metrics: the refusal was counted under the wrong reason");
+        goto out_loop;
+    }
+    if (sc_metric(body, n, "\nmsgsrvd_fsync_seconds_count ") !=
+        l.flushes || l.flushes == 0) {
+        DBG_LOG("metrics: the flush histogram does not add up to %d",
+                (int32_t)l.flushes);
+        goto out_loop;
+    }
+
+    /*
+     * Every slot held by something that connected and then said
+     * nothing. The endpoint has to stay reachable through that, or
+     * four idle connections would be enough to stop anyone seeing the
+     * node again.
+     */
+    {
+        int32_t idle[LOOP_MAX_SCRAPES + 1];
+        int32_t i;
+
+        for (i = 0; i <= LOOP_MAX_SCRAPES; i++) {
+            idle[i] = loop_client_connect(l.metrics_port);
+            if (idle[i] < 0) {
+                DBG_LOG("metrics: could not open an idle connection");
+                goto out_loop;
+            }
+            loop_settle(&l, &e);
+        }
+
+        n = sc_scrape(&l, &e, "GET / HTTP/1.0\r\n\r\n", 18, body,
+                      (int32_t)sizeof(body));
+        for (i = 0; i <= LOOP_MAX_SCRAPES; i++) {
+            loop_read_forget(idle[i]);
+            os_close(&e, idle[i]);
+        }
+        if (n <= 0 || sc_find(body, n, "HTTP/1.0 200 OK\r\n") != 0) {
+            DBG_LOG("metrics: idle connections shut the endpoint out");
+            goto out_loop;
+        }
+    }
+
+    /*
+     * A document that will not fit is refused rather than cut short. A
+     * truncated one reads as a node whose missing metrics never
+     * existed, which is worse than no answer at all.
+     */
+    if (loop_metrics(&l, body, 64) != 0) {
+        DBG_LOG("metrics: a document cut mid-sample was returned");
+        goto out_loop;
+    }
+
+    /*
+     * And one cut exactly at a line ending, which the last byte cannot
+     * tell apart from a document that finished.
+     */
+    if (loop_metrics(&l, body, 56) != 0) {
+        DBG_LOG("metrics: a document cut at a line ending was returned");
+        goto out_loop;
+    }
+
+    rc = 0;
+
+out_loop:
+    loop_shutdown(&l);
+out_wal:
+    wal_close(&w, &e);
+out_dir:
+    tmp_dir_destroy(dir);
+    return rc;
+}
+
 int selfcheck_run(arena_t *a, err_t *e)
 {
     if (selfcheck_arena(a))
@@ -3902,6 +4917,14 @@ int selfcheck_run(arena_t *a, err_t *e)
     if (selfcheck_send_failure())
         return 1;
     if (selfcheck_replication())
+        return 1;
+    if (selfcheck_retention())
+        return 1;
+    if (selfcheck_session_retention())
+        return 1;
+    if (selfcheck_retention_replica())
+        return 1;
+    if (selfcheck_metrics())
         return 1;
     if (selfcheck_err(e))
         return 1;

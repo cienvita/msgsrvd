@@ -174,6 +174,8 @@ static void usage(void)
         "\n"
         "  msgsrvd --dir PATH [--bind ADDR] [--port N]\n"
         "          [--segment-size BYTES] [--leader ADDR:PORT]\n"
+        "          [--retain-segments N] [--replicas N]\n"
+        "          [--metrics-port N]\n"
         "      Serve the write-ahead log in PATH. The directory must\n"
         "      exist. --port 0 asks the kernel to choose one.\n"
         "      Defaults: --bind 127.0.0.1, --port 7400,\n"
@@ -287,7 +289,8 @@ static int inspect_log(const char *dir, int64_t seg_size)
 /* ---- server ---- */
 
 static int run_server(const char *dir, uint32_t bind_ip, const char *bind_text,
-                      uint16_t port, int64_t seg_size, const char *leader)
+                      uint16_t port, int64_t seg_size, const char *leader,
+                      int32_t retain, int32_t replicas, uint16_t metrics_port)
 {
     sockaddr_in_t   leader_addr;
     err_t           e;
@@ -360,6 +363,20 @@ static int run_server(const char *dir, uint32_t bind_ip, const char *bind_text,
         goto out_wal;
     }
 
+    /*
+     * A replica has nobody downstream of it, so the count is the whole
+     * of its retention whatever it was told about replicas.
+     */
+    loop_set_retention(&loop, retain, leader ? 0 : replicas);
+
+    if (metrics_port > 0 &&
+        !result_ok(loop_set_metrics_port(&loop, &e, bind_ip, metrics_port))) {
+        out(2, "msgsrvd: cannot listen on the metrics port\n");
+        dbg_err_print(&e);
+        loop_shutdown(&loop);
+        goto out_wal;
+    }
+
     out(1, "msgsrvd: listening on ");
     out(1, bind_text);
     out(1, ":");
@@ -369,6 +386,15 @@ static int run_server(const char *dir, uint32_t bind_ip, const char *bind_text,
         out(1, leader);
     } else {
         out(1, " leader");
+    }
+    if (metrics_port > 0) {
+        out(1, ", metrics on ");
+        out_u64(1, (uint64_t)loop.metrics_port);
+    }
+    if (retain > 0) {
+        out(1, ", keeping ");
+        out_u64(1, (uint64_t)retain);
+        out(1, " segments");
     }
     out(1, "\n");
 
@@ -410,6 +436,9 @@ int main(int argc, char **argv)
     uint32_t    bind_ip = 0x7F000001;
     uint64_t    port = DEFAULT_PORT;
     uint64_t    seg_size = (uint64_t)DEFAULT_SEG_SIZE;
+    uint64_t    retain = 0;
+    uint64_t    replicas = 0;
+    uint64_t    metrics_port = 0;
     bool_t      selfcheck = FALSE;
     bool_t      inspect = FALSE;
     int32_t     i;
@@ -424,6 +453,9 @@ int main(int argc, char **argv)
         if ((str_eq(argv[i], "--dir") || str_eq(argv[i], "--port") ||
              str_eq(argv[i], "--segment-size") ||
              str_eq(argv[i], "--bind") ||
+             str_eq(argv[i], "--retain-segments") ||
+             str_eq(argv[i], "--replicas") ||
+             str_eq(argv[i], "--metrics-port") ||
              str_eq(argv[i], "--leader")) && i + 1 >= argc) {
             out(2, "msgsrvd: ");
             out(2, argv[i]);
@@ -451,6 +483,22 @@ int main(int argc, char **argv)
             }
         } else if (str_eq(argv[i], "--leader")) {
             leader = argv[++i];
+        } else if (str_eq(argv[i], "--retain-segments")) {
+            if (!parse_u64(argv[++i], &retain) || retain > WAL_MAX_SEGMENTS) {
+                out(2, "msgsrvd: --retain-segments must be 0 to 1024\n");
+                return 2;
+            }
+        } else if (str_eq(argv[i], "--replicas")) {
+            if (!parse_u64(argv[++i], &replicas) ||
+                replicas > LOOP_MAX_REPLICAS) {
+                out(2, "msgsrvd: --replicas must be 0 to 2\n");
+                return 2;
+            }
+        } else if (str_eq(argv[i], "--metrics-port")) {
+            if (!parse_u64(argv[++i], &metrics_port) || metrics_port > 65535) {
+                out(2, "msgsrvd: --metrics-port must be 0 to 65535\n");
+                return 2;
+            }
         } else if (str_eq(argv[i], "--segment-size")) {
             if (!parse_u64(argv[++i], &seg_size) ||
                 seg_size < (uint64_t)WAL_REC_MAX_SIZE) {
@@ -493,5 +541,6 @@ int main(int argc, char **argv)
         return inspect_log(dir, (int64_t)seg_size);
 
     return run_server(dir, bind_ip, bind_text, (uint16_t)port,
-                      (int64_t)seg_size, leader);
+                      (int64_t)seg_size, leader, (int32_t)retain,
+                      (int32_t)replicas, (uint16_t)metrics_port);
 }

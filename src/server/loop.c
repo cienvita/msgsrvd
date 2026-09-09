@@ -1,5 +1,6 @@
 #include "server/loop.h"
 #include "core/mem.h"
+#include "core/fmt.h"
 #include "sys/os.h"
 
 /*
@@ -17,6 +18,8 @@
 #define OP_SIGNAL   3
 #define OP_TIMER    4
 #define OP_STREAM   5
+#define OP_METRICS  6
+#define OP_SCRAPE   7
 
 #define UD_MAKE(op, slot)   (((uint64_t)(op) << 56) | (uint64_t)(uint32_t)(slot))
 #define UD_OP(ud)           ((int32_t)((ud) >> 56))
@@ -39,6 +42,24 @@ static uint8_t stream_send_buf[MSG_HEADER_SIZE * 2];
 /* Somewhere for the signalfd and timerfd reads to land. */
 static uint8_t signal_buf[SIGNALFD_SIGINFO_SIZE];
 static uint8_t timer_buf[TIMERFD_READ_SIZE];
+
+/*
+ * Scrape buffers. The request is read only to find where it ends, and
+ * the response is built once and then sent from here across as many
+ * passes as the socket needs.
+ */
+static uint8_t scrape_in[LOOP_MAX_SCRAPES][LOOP_SCRAPE_CAP];
+static char    scrape_out[LOOP_MAX_SCRAPES][LOOP_METRICS_CAP];
+
+/* Upper bounds of the flush latency buckets, in nanoseconds. */
+static const uint64_t fsync_bound_ns[LOOP_FSYNC_BUCKETS] = {
+    500000, 1000000, 2000000, 5000000, 10000000, 20000000, 50000000
+};
+
+/* The same bounds as Prometheus wants to read them, in seconds. */
+static const char *const fsync_bound_text[LOOP_FSYNC_BUCKETS] = {
+    "0.0005", "0.001", "0.002", "0.005", "0.01", "0.02", "0.05"
+};
 
 /*
  * Say something to the journal.
@@ -95,6 +116,13 @@ static void replica_release(loop_t *l, int32_t idx)
     wal_cursor_close(&l->peer_cursor[idx], &e);
     l->peer_live[idx] = FALSE;
     l->peer_durable[idx] = 0;
+    l->peer_ack_ns[idx] = 0;
+
+    /*
+     * Nothing to recompute: the mark only rises, and with a replica
+     * gone the set is short, so it stays where it is until the replica
+     * is back and has caught up past it.
+     */
 }
 
 /*
@@ -201,8 +229,29 @@ static int32_t text_len(const char *s)
  * to go to instead, which is the one error a client can act on without
  * a human.
  */
-static bool_t reply_err_text(loop_conn_t *c, int32_t slot, uint16_t code,
-                             uint64_t sequence, const char *text)
+/*
+ * Which bucket a refusal is counted in.
+ *
+ * Grouped by what an operator would do about it. The four that name a
+ * state of the node are worth watching on their own; everything else
+ * is a client sending something the server will not take, which is one
+ * number until it is large enough to go looking.
+ */
+static int32_t refused_kind(uint16_t code)
+{
+    switch (code) {
+    case MSG_ERR_NOT_LEADER:    return LOOP_REFUSED_NOT_LEADER;
+    case MSG_ERR_NO_REPLICAS:   return LOOP_REFUSED_NO_REPLICAS;
+    case MSG_ERR_BEHIND:        return LOOP_REFUSED_BEHIND;
+    case MSG_ERR_NO_HISTORY:    return LOOP_REFUSED_NO_HISTORY;
+    case MSG_ERR_STORAGE:       return LOOP_REFUSED_STORAGE;
+    default:                    return LOOP_REFUSED_OTHER;
+    }
+}
+
+static bool_t reply_err_text(loop_t *l, loop_conn_t *c, int32_t slot,
+                             uint16_t code, uint64_t sequence,
+                             const char *text)
 {
     msg_err_payload_t p;
     uint8_t           buf[MSG_ERR_SIZE + MSG_MAX_ERR_TEXT];
@@ -210,6 +259,8 @@ static bool_t reply_err_text(loop_conn_t *c, int32_t slot, uint16_t code,
 
     if (n > MSG_MAX_ERR_TEXT)
         n = MSG_MAX_ERR_TEXT;
+
+    l->refused[refused_kind(code)]++;
 
     p.code = code;
     p.text_len = (uint16_t)n;
@@ -221,10 +272,10 @@ static bool_t reply_err_text(loop_conn_t *c, int32_t slot, uint16_t code,
     return reply(c, slot, MSG_OP_ERR, 0, sequence, buf, MSG_ERR_SIZE + n);
 }
 
-static bool_t reply_err(loop_conn_t *c, int32_t slot, uint16_t code,
-                        uint64_t sequence)
+static bool_t reply_err(loop_t *l, loop_conn_t *c, int32_t slot,
+                       uint16_t code, uint64_t sequence)
 {
-    return reply_err_text(c, slot, code, sequence, NULL);
+    return reply_err_text(l, c, slot, code, sequence, NULL);
 }
 
 static bool_t reply_ack(loop_conn_t *c, int32_t slot, uint16_t flags,
@@ -250,7 +301,7 @@ static void handle_hello(loop_t *l, int32_t slot, const msg_header_t *h,
 
     if (!msg_decode_hello(payload, payload_len, &hello) ||
         !msg_hello_valid(&hello, payload_len)) {
-        reply_err(c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
         c->closing = TRUE;
         return;
     }
@@ -258,7 +309,7 @@ static void handle_hello(loop_t *l, int32_t slot, const msg_header_t *h,
     if (hello.session == 0) {
         s = session_create(l->sessions);
         if (!s) {
-            reply_err(c, slot, MSG_ERR_SESSION_UNKNOWN, h->sequence);
+            reply_err(l, c, slot, MSG_ERR_SESSION_UNKNOWN, h->sequence);
             c->closing = TRUE;
             return;
         }
@@ -270,7 +321,7 @@ static void handle_hello(loop_t *l, int32_t slot, const msg_header_t *h,
              * handed a fresh one, so it cannot mistake a new session
              * for its old one and skip resending what was in flight.
              */
-            reply_err(c, slot, MSG_ERR_SESSION_UNKNOWN, h->sequence);
+            reply_err(l, c, slot, MSG_ERR_SESSION_UNKNOWN, h->sequence);
             return;
         }
     }
@@ -354,6 +405,48 @@ static uint64_t repl_best(const loop_t *l)
 }
 
 /*
+ * The sequence retention is allowed to delete up to.
+ *
+ * Every replica the node expects has to be attached and to have
+ * confirmed the mark, so one that is away holds the log where it is
+ * rather than letting the leader delete what that replica has not got.
+ * A replica asking to stream from below the retained log cannot be
+ * repaired by streaming, so the cost of being wrong here is a re-seed
+ * by hand and the cost of being slow is disk.
+ *
+ * The mark only rises. A replica dropping does not un-confirm what it
+ * already had; it stops the mark moving on.
+ *
+ * Marks cannot be remembered per slot instead. Replicas have no
+ * identity on the wire and take whichever slot is free, so one coming
+ * back into the other's slot would inherit a promise it never made.
+ * Requiring the whole set to be present is what makes the mark safe
+ * without anyone having a name.
+ */
+static void retain_floor_update(loop_t *l)
+{
+    uint64_t lowest = 0;
+    int32_t  live = 0;
+    int32_t  i;
+
+    if (l->replicas_want <= 0)
+        return;
+
+    for (i = 0; i < LOOP_MAX_REPLICAS; i++) {
+        if (!l->peer_live[i])
+            continue;
+        if (live == 0 || l->peer_durable[i] < lowest)
+            lowest = l->peer_durable[i];
+        live++;
+    }
+
+    if (live < l->replicas_want)
+        return;
+    if (lowest > l->retain_floor)
+        l->retain_floor = lowest;
+}
+
+/*
  * Route an owed acknowledgement to the slot that can satisfy it.
  *
  * A write that asked only for local durability is answered by the
@@ -398,7 +491,7 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
     bool_t          degradable;
 
     if (!s) {
-        reply_err(c, slot, MSG_ERR_NO_SESSION, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_NO_SESSION, h->sequence);
         c->closing = TRUE;
         return;
     }
@@ -409,7 +502,7 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
      * to claim, so the client is sent to the leader instead.
      */
     if (l->is_follower) {
-        reply_err_text(c, slot, MSG_ERR_NOT_LEADER, h->sequence,
+        reply_err_text(l, c, slot, MSG_ERR_NOT_LEADER, h->sequence,
                        l->leader_text);
         return;
     }
@@ -424,7 +517,7 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
      * deadline first would only delay the same answer.
      */
     if (wants_repl && !repl_live(l) && !degradable) {
-        reply_err(c, slot, MSG_ERR_NO_REPLICAS, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_NO_REPLICAS, h->sequence);
         return;
     }
 
@@ -468,7 +561,7 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
              * disk above all, and saying so is what points at the node
              * rather than at the sender.
              */
-            reply_err(c, slot,
+            reply_err(l, c, slot,
                       r.code == ERR_INVALID ? MSG_ERR_PAYLOAD_TOO_BIG
                                             : MSG_ERR_STORAGE,
                       h->sequence);
@@ -479,6 +572,7 @@ static void handle_write(loop_t *l, int32_t slot, const msg_header_t *h,
     l->writes++;
     l->wal_dirty = TRUE;
     s->last_client_seq = h->sequence;
+    session_touch(l->sessions, s);
 
     if (h->flags & MSG_FLAG_ACK_REQ)
         ack_write(l, c, h, ack_flags, wants_repl, degradable, h->sequence,
@@ -512,7 +606,7 @@ static void handle_subscribe(loop_t *l, int32_t slot, const msg_header_t *h,
     err_t            e;
 
     if (!msg_decode_subscribe(payload, payload_len, &req)) {
-        reply_err(c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
         c->closing = TRUE;
         return;
     }
@@ -520,7 +614,7 @@ static void handle_subscribe(loop_t *l, int32_t slot, const msg_header_t *h,
     if (c->sub.active || c->sub.waiting) {
         /* One stream per connection. A second would need its own
          * cursor and its own place in the send buffer. */
-        reply_err(c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
         return;
     }
 
@@ -546,7 +640,7 @@ static void handle_subscribe(loop_t *l, int32_t slot, const msg_header_t *h,
     if (!result_ok(wal_cursor_seek(l->wal, &e, &c->sub.cursor, from, scratch,
                                    scratch_len))) {
         /* Older than this node retains, or past the end of its log. */
-        reply_err(c, slot, MSG_ERR_NO_HISTORY, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_NO_HISTORY, h->sequence);
         return;
     }
 
@@ -584,13 +678,13 @@ static void handle_read(loop_t *l, int32_t slot, const msg_header_t *h,
     err_t        e;
 
     if (!msg_decode_read(payload, payload_len, &req)) {
-        reply_err(c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_PAYLOAD_TOO_BIG, h->sequence);
         c->closing = TRUE;
         return;
     }
 
     if (c->sub.active || c->sub.waiting) {
-        reply_err(c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
         return;
     }
 
@@ -637,7 +731,7 @@ static void handle_read(loop_t *l, int32_t slot, const msg_header_t *h,
     wal_cursor_init(&c->sub.cursor);
     if (!result_ok(wal_cursor_seek(l->wal, &e, &c->sub.cursor, from, scratch,
                                    scratch_len))) {
-        reply_err(c, slot, MSG_ERR_NO_HISTORY, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_NO_HISTORY, h->sequence);
         return;
     }
 
@@ -691,7 +785,7 @@ static void subs_push(loop_t *l, uint8_t *scratch, int32_t scratch_len)
                 l->progress = TRUE;
             } else if (l->tick >= c->sub.deadline) {
                 c->sub.waiting = FALSE;
-                reply_err(c, i, MSG_ERR_BEHIND, c->sub.min_seq);
+                reply_err(l, c, i, MSG_ERR_BEHIND, c->sub.min_seq);
                 err_init(&e);
                 wal_cursor_close(&c->sub.cursor, &e);
             }
@@ -724,6 +818,13 @@ static void subs_push(loop_t *l, uint8_t *scratch, int32_t scratch_len)
         err_init(&e);
         if (!result_ok(wal_cursor_read(l->wal, &e, &c->sub.cursor, durable,
                                        scratch, room, &got))) {
+            /*
+             * Retention has taken what this stream was reading, or the
+             * log cannot be read at all. Either way the client is told
+             * on the connection it was using rather than left to find
+             * out by reconnecting and being refused there.
+             */
+            reply_err(l, c, i, MSG_ERR_NO_HISTORY, c->sub.cursor.next_seq);
             c->closing = TRUE;
             continue;
         }
@@ -781,7 +882,7 @@ static void handle_repl_start(loop_t *l, int32_t slot, const msg_header_t *h,
          * a stream from it. Saying where the leader is turns a
          * misconfigured replica into one that finds its way.
          */
-        reply_err_text(c, slot, MSG_ERR_NOT_LEADER, h->sequence,
+        reply_err_text(l, c, slot, MSG_ERR_NOT_LEADER, h->sequence,
                        l->leader_text);
         c->closing = TRUE;
         return;
@@ -794,7 +895,7 @@ static void handle_repl_start(loop_t *l, int32_t slot, const msg_header_t *h,
         }
     }
     if (idx < 0) {
-        reply_err(c, slot, MSG_ERR_NO_REPLICAS, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_NO_REPLICAS, h->sequence);
         c->closing = TRUE;
         return;
     }
@@ -808,7 +909,7 @@ static void handle_repl_start(loop_t *l, int32_t slot, const msg_header_t *h,
          * is something a stream can repair: the replica needs a copy
          * of the segments, which is an operator's job.
          */
-        reply_err(c, slot, MSG_ERR_NO_HISTORY, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_NO_HISTORY, h->sequence);
         c->closing = TRUE;
         return;
     }
@@ -819,6 +920,8 @@ static void handle_repl_start(loop_t *l, int32_t slot, const msg_header_t *h,
     c->send_len = 0;
     l->peer_live[idx] = TRUE;
     l->peer_durable[idx] = h->sequence - 1;
+    l->peer_ack_ns[idx] = os_now_ns();
+    retain_floor_update(l);
     arm_timer_now(l);
 }
 
@@ -1041,8 +1144,11 @@ static void handle_frame(loop_t *l, int32_t slot, const conn_action_t *a,
          * else: the leader knows what it sent, and the replica only
          * has to say how far it got.
          */
-        if (c->replica >= 0)
+        if (c->replica >= 0) {
             l->peer_durable[c->replica] = h->sequence;
+            l->peer_ack_ns[c->replica] = os_now_ns();
+            retain_floor_update(l);
+        }
         break;
     case MSG_OP_SUBSCRIBE:
         handle_subscribe(l, slot, h, a->u.frame.payload,
@@ -1053,11 +1159,11 @@ static void handle_frame(loop_t *l, int32_t slot, const conn_action_t *a,
                     scratch, scratch_len);
         break;
     case MSG_OP_DELETE:
-        reply_err(c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_UNSUPPORTED, h->sequence);
         break;
     default:
         /* A server-to-client verb arriving from a client is nonsense. */
-        reply_err(c, slot, MSG_ERR_BAD_OP, h->sequence);
+        reply_err(l, c, slot, MSG_ERR_BAD_OP, h->sequence);
         c->closing = TRUE;
         break;
     }
@@ -1139,7 +1245,7 @@ static void on_recv(tick_ctx_t *tc, int32_t slot, int32_t res)
                              tc->scratch_len);
                 break;
             case CONN_ACTION_REPLY_ERR:
-                reply_err(c, slot, actions[i].u.reply_err.code,
+                reply_err(l, c, slot, actions[i].u.reply_err.code,
                           actions[i].u.reply_err.sequence);
                 break;
             case CONN_ACTION_CLOSE:
@@ -1552,6 +1658,460 @@ static void do_repl_send(loop_t *l)
     stream_send(l);
 }
 
+/* ---- metrics ---- */
+
+/*
+ * The endpoint speaks the least HTTP that works.
+ *
+ * Read until the blank line that ends the request head, ignore every
+ * byte of it, write one response, close. There is no routing, no
+ * method check and no keep-alive, so the request is never interpreted
+ * and the only thing this parser can get wrong is where it stops. That
+ * matters: it is the second parser in the process reading from a
+ * socket, and the first one is the reason the daemon is treated as the
+ * process most likely to have a bug.
+ */
+static const char metrics_head[] =
+    "HTTP/1.0 200 OK\r\n"
+    "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+    "Connection: close\r\n"
+    "\r\n";
+
+/* One metric family carrying a single unlabelled sample. */
+static int32_t m_one(char *b, int32_t cap, int32_t at, const char *name,
+                     const char *type, uint64_t v)
+{
+    at = fmt_str(b, cap, at, "# TYPE ");
+    at = fmt_str(b, cap, at, name);
+    at = fmt_str(b, cap, at, " ");
+    at = fmt_str(b, cap, at, type);
+    at = fmt_str(b, cap, at, "\n");
+    at = fmt_str(b, cap, at, name);
+    at = fmt_str(b, cap, at, " ");
+    at = fmt_u64(b, cap, at, v);
+    at = fmt_str(b, cap, at, "\n");
+    return at;
+}
+
+/* A sample of an already-declared family, with one label. */
+static int32_t m_label(char *b, int32_t cap, int32_t at, const char *name,
+                       const char *label, const char *value, uint64_t v)
+{
+    at = fmt_str(b, cap, at, name);
+    at = fmt_str(b, cap, at, "{");
+    at = fmt_str(b, cap, at, label);
+    at = fmt_str(b, cap, at, "=\"");
+    at = fmt_str(b, cap, at, value);
+    at = fmt_str(b, cap, at, "\"} ");
+    at = fmt_u64(b, cap, at, v);
+    at = fmt_str(b, cap, at, "\n");
+    return at;
+}
+
+static int32_t m_type(char *b, int32_t cap, int32_t at, const char *name,
+                      const char *type)
+{
+    at = fmt_str(b, cap, at, "# TYPE ");
+    at = fmt_str(b, cap, at, name);
+    at = fmt_str(b, cap, at, " ");
+    at = fmt_str(b, cap, at, type);
+    at = fmt_str(b, cap, at, "\n");
+    return at;
+}
+
+/* Decimal for a replica slot. There are two, so this is enough. */
+static const char *const slot_text[LOOP_MAX_REPLICAS] = { "0", "1" };
+
+static const char *const refused_text[LOOP_REFUSED_KINDS] = {
+    "not_leader", "no_replicas", "behind", "no_history", "storage", "other"
+};
+
+int32_t loop_metrics(loop_t *l, char *buf, int32_t cap)
+{
+    uint64_t now = os_now_ns();
+    uint64_t cumulative = 0;
+    int32_t  at = 0;
+    int32_t  i;
+
+    if (!l || !buf || cap <= 0)
+        return 0;
+
+    /* What this node is. Both samples always, so a query for the role
+     * it does not have gets a zero rather than nothing. */
+    at = m_type(buf, cap, at, "msgsrvd_role", "gauge");
+    at = m_label(buf, cap, at, "msgsrvd_role", "role", "leader",
+                 l->is_follower ? 0 : 1);
+    at = m_label(buf, cap, at, "msgsrvd_role", "role", "follower",
+                 l->is_follower ? 1 : 0);
+
+    /* The log. */
+    at = m_one(buf, cap, at, "msgsrvd_first_seq", "gauge",
+               wal_first_seq(l->wal));
+    at = m_one(buf, cap, at, "msgsrvd_durable_seq", "gauge",
+               wal_durable_seq(l->wal));
+    at = m_one(buf, cap, at, "msgsrvd_next_seq", "gauge",
+               wal_next_seq(l->wal));
+    at = m_one(buf, cap, at, "msgsrvd_segments", "gauge",
+               (uint64_t)wal_segments(l->wal));
+    at = m_one(buf, cap, at, "msgsrvd_segment_bytes", "gauge",
+               (uint64_t)wal_seg_capacity(l->wal));
+
+    /*
+     * Segments are preallocated, so the log's footprint is what it has
+     * been given and not what it has written into. That is the number
+     * the volume runs out of.
+     */
+    at = m_one(buf, cap, at, "msgsrvd_wal_bytes", "gauge",
+               (uint64_t)wal_segments(l->wal) *
+               (uint64_t)wal_seg_capacity(l->wal));
+
+    /* Retention, including its configuration: an endpoint that reports
+     * only behaviour cannot say whether a node was asked for it. */
+    at = m_one(buf, cap, at, "msgsrvd_retain_segments", "gauge",
+               (uint64_t)l->retain_segments);
+    at = m_one(buf, cap, at, "msgsrvd_replicas_expected", "gauge",
+               (uint64_t)l->replicas_want);
+    at = m_one(buf, cap, at, "msgsrvd_retain_floor", "gauge",
+               l->retain_floor);
+    at = m_one(buf, cap, at, "msgsrvd_retain_removed_total", "counter",
+               l->retain_removed);
+    at = m_one(buf, cap, at, "msgsrvd_retain_errors_total", "counter",
+               l->retain_errors);
+
+    /* Who is attached. */
+    at = m_one(buf, cap, at, "msgsrvd_connections", "gauge",
+               (uint64_t)loop_live_conns(l));
+    at = m_one(buf, cap, at, "msgsrvd_sessions", "gauge",
+               (uint64_t)l->sessions->count);
+    at = m_one(buf, cap, at, "msgsrvd_sessions_evicted_total", "counter",
+               l->sessions->evicted);
+    at = m_one(buf, cap, at, "msgsrvd_accepted_total", "counter",
+               l->accepted);
+    at = m_one(buf, cap, at, "msgsrvd_closed_total", "counter", l->closed);
+
+    /* Replication, from whichever side this node is on. */
+    if (l->is_follower) {
+        at = m_one(buf, cap, at, "msgsrvd_leader_connected", "gauge",
+                   (l->repl_fd >= 0 && !l->repl_connecting) ? 1 : 0);
+        at = m_one(buf, cap, at, "msgsrvd_repl_applied_total", "counter",
+                   l->repl_records);
+    } else {
+        at = m_type(buf, cap, at, "msgsrvd_follower_live", "gauge");
+        for (i = 0; i < LOOP_MAX_REPLICAS; i++)
+            at = m_label(buf, cap, at, "msgsrvd_follower_live", "slot",
+                         slot_text[i], l->peer_live[i] ? 1 : 0);
+
+        at = m_type(buf, cap, at, "msgsrvd_follower_durable_seq", "gauge");
+        for (i = 0; i < LOOP_MAX_REPLICAS; i++)
+            at = m_label(buf, cap, at, "msgsrvd_follower_durable_seq",
+                         "slot", slot_text[i], l->peer_durable[i]);
+
+        /*
+         * How long since each replica last said where it had got to.
+         * This is what the "a follower has been gone too long" alert
+         * reads, and it is in seconds because a lag in sequences says
+         * nothing on a log that is not being written to.
+         */
+        at = m_type(buf, cap, at, "msgsrvd_follower_ack_age_seconds",
+                    "gauge");
+        for (i = 0; i < LOOP_MAX_REPLICAS; i++) {
+            uint64_t age = 0;
+
+            if (l->peer_ack_ns[i] > 0 && now > l->peer_ack_ns[i])
+                age = now - l->peer_ack_ns[i];
+            at = fmt_str(buf, cap, at, "msgsrvd_follower_ack_age_seconds"
+                                       "{slot=\"");
+            at = fmt_str(buf, cap, at, slot_text[i]);
+            at = fmt_str(buf, cap, at, "\"} ");
+            at = fmt_ns_seconds(buf, cap, at, age);
+            at = fmt_str(buf, cap, at, "\n");
+        }
+
+        at = m_one(buf, cap, at, "msgsrvd_repl_records_total", "counter",
+                   l->repl_records);
+    }
+
+    /* Writes and what they were answered with. */
+    at = m_one(buf, cap, at, "msgsrvd_writes_total", "counter", l->writes);
+    at = m_one(buf, cap, at, "msgsrvd_dedup_hits_total", "counter",
+               l->dedup_hits);
+
+    at = m_type(buf, cap, at, "msgsrvd_acks_total", "counter");
+    at = m_label(buf, cap, at, "msgsrvd_acks_total", "durability", "append",
+                 l->acks_append);
+    at = m_label(buf, cap, at, "msgsrvd_acks_total", "durability", "sync",
+                 l->acks_sync);
+    at = m_label(buf, cap, at, "msgsrvd_acks_total", "durability",
+                 "replicated", l->acks_repl);
+    at = m_one(buf, cap, at, "msgsrvd_acks_degraded_total", "counter",
+               l->repl_degraded);
+
+    at = m_type(buf, cap, at, "msgsrvd_refused_total", "counter");
+    for (i = 0; i < LOOP_REFUSED_KINDS; i++)
+        at = m_label(buf, cap, at, "msgsrvd_refused_total", "reason",
+                     refused_text[i], l->refused[i]);
+
+    at = m_one(buf, cap, at, "msgsrvd_notified_total", "counter",
+               l->notified);
+
+    /* Flushes, and how long they took. */
+    at = m_type(buf, cap, at, "msgsrvd_fsync_seconds", "histogram");
+    for (i = 0; i < LOOP_FSYNC_BUCKETS; i++) {
+        cumulative += l->fsync_bucket[i];
+        at = m_label(buf, cap, at, "msgsrvd_fsync_seconds_bucket", "le",
+                     fsync_bound_text[i], cumulative);
+    }
+    cumulative += l->fsync_bucket[LOOP_FSYNC_BUCKETS];
+    at = m_label(buf, cap, at, "msgsrvd_fsync_seconds_bucket", "le", "+Inf",
+                 cumulative);
+    at = fmt_str(buf, cap, at, "msgsrvd_fsync_seconds_sum ");
+    at = fmt_ns_seconds(buf, cap, at, l->fsync_ns_total);
+    at = fmt_str(buf, cap, at, "\n");
+    at = fmt_str(buf, cap, at, "msgsrvd_fsync_seconds_count ");
+    at = fmt_u64(buf, cap, at, cumulative);
+    at = fmt_str(buf, cap, at, "\n");
+    at = m_one(buf, cap, at, "msgsrvd_flushes_total", "counter", l->flushes);
+
+    /* The endpoint's own traffic. */
+    at = m_one(buf, cap, at, "msgsrvd_scrapes_total", "counter",
+               l->scrapes_served);
+    at = m_one(buf, cap, at, "msgsrvd_scrapes_refused_total", "counter",
+               l->scrapes_refused);
+
+    /*
+     * A document that hit the ceiling is refused rather than served.
+     * Truncation is invisible to a scraper: what it would read is a
+     * shorter document in which the missing metrics look as though
+     * they had never existed. The last line is what proves the whole
+     * of it fit.
+     */
+    if (at <= 0 || at >= cap)
+        return 0;
+    if (buf[at - 1] != '\n')
+        return 0;
+    return at;
+}
+
+/* ---- scrapes ---- */
+
+static void scrape_release(loop_t *l, int32_t i)
+{
+    loop_scrape_t *sc = &l->scrapes[i];
+    err_t          e;
+
+    if (sc->fd < 0)
+        return;
+
+    err_init(&e);
+    os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_DEL, sc->fd, 0, 0);
+    os_close(&e, sc->fd);
+    mem_zero((uint8_t *)sc, (int32_t)sizeof(*sc));
+    sc->fd = -1;
+}
+
+/*
+ * Watch for room to write instead of for more to read.
+ *
+ * Once there is an answer the request no longer matters, and anything
+ * further the scraper says will not be looked at. Leaving readability
+ * registered would report the same unread bytes on every pass, and a
+ * loop woken by something it has decided to ignore does not sleep.
+ */
+static void scrape_answering(loop_t *l, int32_t i)
+{
+    loop_scrape_t *sc = &l->scrapes[i];
+    err_t          e;
+
+    if (sc->fd < 0 || sc->answering)
+        return;
+
+    err_init(&e);
+    if (result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_MOD, sc->fd,
+                               EPOLLOUT, UD_MAKE(OP_SCRAPE, i))))
+        sc->answering = TRUE;
+}
+
+/* Push what is left of the response. */
+static void scrape_send(loop_t *l, int32_t i)
+{
+    loop_scrape_t *sc = &l->scrapes[i];
+    int32_t        res = 0;
+
+    if (sc->fd < 0 || sc->out_len <= sc->sent)
+        return;
+
+    os_send(sc->fd, (const uint8_t *)scrape_out[i] + sc->sent,
+            sc->out_len - sc->sent, MSG_NOSIGNAL | MSG_DONTWAIT, &res);
+
+    if (res == -EAGAIN) {
+        scrape_answering(l, i);
+        return;
+    }
+    if (res <= 0) {
+        /* The reader went away mid-answer. Nothing to report to. */
+        scrape_release(l, i);
+        return;
+    }
+
+    sc->sent += res;
+    if (sc->sent >= sc->out_len) {
+        l->scrapes_served++;
+        scrape_release(l, i);
+        return;
+    }
+    scrape_answering(l, i);
+}
+
+/*
+ * Build the response for a request that has ended.
+ *
+ * A document that would not fit is answered with 503 rather than with
+ * a shorter document, for the same reason loop_metrics refuses to
+ * truncate: a metric that is missing reads as a metric that does not
+ * exist, and a scraper cannot tell the two apart.
+ */
+static void scrape_answer(loop_t *l, int32_t i)
+{
+    loop_scrape_t *sc = &l->scrapes[i];
+    int32_t        head = (int32_t)sizeof(metrics_head) - 1;
+    int32_t        body;
+
+    body = loop_metrics(l, scrape_out[i] + head, LOOP_METRICS_CAP - head);
+    if (body <= 0) {
+        static const char oops[] =
+            "HTTP/1.0 503 Service Unavailable\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        sc->out_len = (int32_t)sizeof(oops) - 1;
+        mem_copy((uint8_t *)scrape_out[i], (const uint8_t *)oops,
+                 sc->out_len);
+        l->scrapes_refused++;
+    } else {
+        mem_copy((uint8_t *)scrape_out[i], (const uint8_t *)metrics_head,
+                 head);
+        sc->out_len = head + body;
+    }
+
+    sc->sent = 0;
+    scrape_send(l, i);
+}
+
+/*
+ * Read what a scraper sent, only to find where it stops.
+ *
+ * The head ends at a blank line. Both spellings are accepted because
+ * accepting one costs nothing and a client that ends its lines with
+ * bare newlines is not doing anything ambiguous.
+ */
+static void scrape_recv(loop_t *l, int32_t i)
+{
+    loop_scrape_t *sc = &l->scrapes[i];
+    int32_t        res = 0;
+    int32_t        at;
+
+    if (sc->fd < 0)
+        return;
+    if (sc->out_len > 0)
+        return;                     /* answered already; it can stop talking */
+
+    if (sc->in_len >= LOOP_SCRAPE_CAP) {
+        l->scrapes_refused++;
+        scrape_release(l, i);
+        return;
+    }
+
+    os_recv(sc->fd, scrape_in[i] + sc->in_len, LOOP_SCRAPE_CAP - sc->in_len,
+            MSG_DONTWAIT, &res);
+
+    if (res == -EAGAIN)
+        return;
+    if (res <= 0) {
+        scrape_release(l, i);
+        return;
+    }
+
+    sc->in_len += res;
+
+    for (at = 1; at < sc->in_len; at++) {
+        if (scrape_in[i][at] != '\n')
+            continue;
+        if (scrape_in[i][at - 1] == '\n' ||
+            (at >= 3 && scrape_in[i][at - 1] == '\r' &&
+             scrape_in[i][at - 2] == '\n')) {
+            scrape_answer(l, i);
+            return;
+        }
+    }
+
+    /*
+     * The head is longer than a request head has any reason to be.
+     * Whatever is on the other end is not a scraper, and it is dropped
+     * without an answer: replying would be describing this node to
+     * something that could not ask for it properly.
+     */
+    if (sc->in_len >= LOOP_SCRAPE_CAP) {
+        l->scrapes_refused++;
+        scrape_release(l, i);
+    }
+}
+
+static void scrape_accept(loop_t *l)
+{
+    err_t   e;
+    int32_t fd = -1;
+    int32_t i;
+    int32_t slot = -1;
+
+    if (l->stop || l->metrics_fd < 0)
+        return;
+
+    err_init(&e);
+    if (!result_ok(os_accept4(&e, l->metrics_fd, SOCK_NONBLOCK | SOCK_CLOEXEC,
+                              &fd)))
+        return;
+
+    for (i = 0; i < LOOP_MAX_SCRAPES; i++) {
+        if (l->scrapes[i].fd < 0) {
+            slot = i;
+            break;
+        }
+    }
+
+    /*
+     * Every slot busy, so the oldest goes. Nothing here has a deadline
+     * of its own: a connection that opens and then says nothing would
+     * otherwise hold its slot for as long as it stayed open, and four
+     * of those would put the endpoint out of reach for good. Losing
+     * one answer to make room is the cheaper failure, since a scrape
+     * carries no state and the next one asks the same question.
+     */
+    if (slot < 0) {
+        uint64_t oldest = 0;
+
+        for (i = 0; i < LOOP_MAX_SCRAPES; i++) {
+            if (slot < 0 || l->scrapes[i].opened_ns < oldest) {
+                oldest = l->scrapes[i].opened_ns;
+                slot = i;
+            }
+        }
+        l->scrapes_refused++;
+        scrape_release(l, slot);
+    }
+
+    if (!result_ok(os_epoll_ctl(&e, l->epoll_fd, EPOLL_CTL_ADD, fd, EPOLLIN,
+                                UD_MAKE(OP_SCRAPE, slot)))) {
+        os_close(&e, fd);
+        return;
+    }
+
+    mem_zero((uint8_t *)&l->scrapes[slot],
+             (int32_t)sizeof(l->scrapes[slot]));
+    l->scrapes[slot].fd = fd;
+    l->scrapes[slot].opened_ns = os_now_ns();
+}
+
 /*
  * EPOLLERR and EPOLLHUP arrive whether they were asked for or not, and
  * both mean the same thing here as readable does: take the receive and
@@ -1593,6 +2153,15 @@ static void tick_event(tick_ctx_t *tc, uint64_t user_data, uint32_t events)
             if (events & EPOLLOUT)
                 do_repl_send(l);
         }
+        break;
+    case OP_METRICS:
+        scrape_accept(l);
+        break;
+    case OP_SCRAPE:
+        if (events & EV_READABLE)
+            scrape_recv(l, slot);
+        if (events & EPOLLOUT)
+            scrape_send(l, slot);
         break;
     default:
         break;
@@ -1755,6 +2324,123 @@ static void arm_stream(loop_t *l)
 }
 
 /*
+ * Record how long a flush took.
+ *
+ * Buckets are stored as the count that landed in each rather than
+ * cumulatively, and summed on the way out. Storing them cumulatively
+ * would mean touching every bucket above the one that was hit, which
+ * is more work per flush to save arithmetic on a scrape that happens
+ * once every few seconds.
+ *
+ * A clock that would not answer reports zero, and a zero start makes
+ * the measurement land in the first bucket. That is a wrong sample
+ * rather than a wrong total, and it cannot be told apart from a fast
+ * flush here; the endpoint is the wrong place to argue about it.
+ */
+static void fsync_observe(loop_t *l, uint64_t began_ns)
+{
+    uint64_t ns = 0;
+    int32_t  i;
+
+    if (began_ns > 0) {
+        uint64_t now = os_now_ns();
+
+        if (now > began_ns)
+            ns = now - began_ns;
+    }
+
+    l->fsync_ns_total += ns;
+    for (i = 0; i < LOOP_FSYNC_BUCKETS; i++) {
+        if (ns <= fsync_bound_ns[i]) {
+            l->fsync_bucket[i]++;
+            return;
+        }
+    }
+    l->fsync_bucket[LOOP_FSYNC_BUCKETS]++;
+}
+
+/*
+ * Delete segments this node no longer needs.
+ *
+ * The count is the limit that always applies, and it is what bounds
+ * both disk use and the recovery scan. On a leader expecting replicas
+ * the confirmed mark applies as well, and the lower of the two wins.
+ *
+ * Run at the end of a pass rather than beside the flush. The unlinks
+ * and the directory fsync that makes them durable are storage latency
+ * with nothing waiting on them, and putting them between the flush and
+ * the acknowledgements it releases would add that latency to every
+ * write in the batch.
+ */
+static void retain_pass(loop_t *l)
+{
+    uint64_t keep_from;
+    int32_t  removed = 0;
+    int32_t  segments;
+    err_t    e;
+
+    if (l->retain_segments <= 0)
+        return;
+
+    segments = wal_segments(l->wal);
+
+    /*
+     * A failed unlink is not retried every pass. A directory is
+     * unlikely to change its mind within a tenth of a second, and a
+     * fault that persists would otherwise put a line in the journal
+     * ten times a second for as long as it lasted. The next rollover
+     * is what makes the attempt worth repeating.
+     */
+    if (l->retain_failed) {
+        if (segments == l->retain_seen_segs)
+            return;
+        l->retain_failed = FALSE;
+    }
+    l->retain_seen_segs = segments;
+
+    keep_from = wal_retain_mark(l->wal, l->retain_segments);
+    if (keep_from == 0)
+        return;
+
+    /*
+     * A leader that expects replicas and has heard from none has a
+     * floor of zero, so keep_from becomes 1 and nothing is below it.
+     * That is the right state for a node just promoted: it deletes
+     * nothing until the replicas that survived have caught up.
+     */
+    if (l->replicas_want > 0 && l->retain_floor + 1 < keep_from)
+        keep_from = l->retain_floor + 1;
+
+    if (keep_from <= wal_first_seq(l->wal))
+        return;
+
+    err_init(&e);
+    if (!result_ok(wal_retain(l->wal, &e, keep_from, &removed))) {
+        l->retain_errors++;
+        l->retain_failed = TRUE;
+        say("msgsrvd: retention could not remove a segment\n");
+    }
+    l->retain_removed += (uint64_t)removed;
+}
+
+/*
+ * Which level an acknowledgement answered.
+ *
+ * Read off the flags going out rather than the ones that came in, so a
+ * write that asked for a second copy and was told it has one copy is
+ * counted as the local flush it actually got.
+ */
+static void ack_count(loop_t *l, uint16_t flags)
+{
+    if ((flags & MSG_FLAG_REPLICATED) && !(flags & MSG_FLAG_DEGRADED))
+        l->acks_repl++;
+    else if (flags & MSG_FLAG_SYNC)
+        l->acks_sync++;
+    else
+        l->acks_append++;
+}
+
+/*
  * Send the acknowledgements this pass has made true.
  *
  * The local slot is answered by the flush that has just happened. The
@@ -1779,6 +2465,7 @@ static void acks_emit(loop_t *l)
         if (c->ack_local.due) {
             reply_ack(c, i, c->ack_local.flags, c->ack_local.wal_seq,
                       c->ack_local.client_seq);
+            ack_count(l, c->ack_local.flags);
             ack_clear(&c->ack_local);
         }
 
@@ -1789,6 +2476,7 @@ static void acks_emit(loop_t *l)
             wal_durable_seq(l->wal) >= c->ack_repl.wal_seq) {
             reply_ack(c, i, c->ack_repl.flags, c->ack_repl.wal_seq,
                       c->ack_repl.client_seq);
+            ack_count(l, c->ack_repl.flags);
             ack_clear(&c->ack_repl);
             continue;
         }
@@ -1799,6 +2487,7 @@ static void acks_emit(loop_t *l)
         if (c->ack_repl.degradable) {
             reply_ack(c, i, (uint16_t)(c->ack_repl.flags | MSG_FLAG_DEGRADED),
                       c->ack_repl.wal_seq, c->ack_repl.client_seq);
+            ack_count(l, (uint16_t)(c->ack_repl.flags | MSG_FLAG_DEGRADED));
             l->repl_degraded++;
         } else {
             /*
@@ -1807,7 +2496,7 @@ static void acks_emit(loop_t *l)
              * satisfies. Every record of this session at that level and
              * below it is refused, and the client resends or gives up.
              */
-            reply_err(c, i, MSG_ERR_NO_REPLICAS, c->ack_repl.client_seq);
+            reply_err(l, c, i, MSG_ERR_NO_REPLICAS, c->ack_repl.client_seq);
         }
         ack_clear(&c->ack_repl);
     }
@@ -1856,7 +2545,10 @@ result_t loop_init(loop_t *l, err_t *e, wal_t *wal,
     l->signal_fd = -1;
     l->timer_fd = -1;
     l->repl_fd = -1;
+    l->metrics_fd = -1;
 
+    for (i = 0; i < LOOP_MAX_SCRAPES; i++)
+        l->scrapes[i].fd = -1;
     for (i = 0; i < LOOP_MAX_CONNS; i++)
         slot_reset(l, i);
     for (i = 0; i < LOOP_MAX_REPLICAS; i++)
@@ -1923,7 +2615,14 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
      * the listener, the signalfd, the timerfd and the follower's
      * stream. Sized so one wait can never leave an event behind.
      */
-    static epoll_event_t events[LOOP_MAX_CONNS + 4];
+    /*
+     * Room for every descriptor the loop can hold at once: a slot
+     * each, the scrapes, and the five singletons (both listeners, the
+     * signal, the timer and the stream). A short array is not wrong,
+     * since epoll reports the rest on the next call, but it would put
+     * off the flush that the connections already read are waiting for.
+     */
+    static epoll_event_t events[LOOP_MAX_CONNS + LOOP_MAX_SCRAPES + 5];
     static uint8_t scratch[WAL_REC_MAX_SIZE];
     tick_ctx_t tc;
     result_t   r;
@@ -1964,10 +2663,13 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
      * answered with a weaker guarantee than it actually got.
      */
     if (l->wal_dirty) {
+        uint64_t began = os_now_ns();
+
         r = wal_sync(l->wal, e);
         if (!result_ok(r))
             return r;
         l->flushes++;
+        fsync_observe(l, began);
     }
 
     /* Only now is an acknowledgement true, so only now is it staged. */
@@ -1989,6 +2691,14 @@ result_t loop_tick(loop_t *l, err_t *e, bool_t wait)
      * it is on this node's disk.
      */
     subs_push(l, scratch, (int32_t)sizeof(scratch));
+
+    /*
+     * Last, once everything this pass promised has been served. A
+     * cursor the delete invalidates is noticed on the next pass, which
+     * is where it would have been noticed anyway had the delete landed
+     * a moment later.
+     */
+    retain_pass(l);
 
     repl_dial(l);
     arm_conns(l);
@@ -2042,6 +2752,68 @@ result_t loop_run(loop_t *l, err_t *e)
     return RESULT_OK;
 }
 
+void loop_set_retention(loop_t *l, int32_t keep_segments, int32_t replicas)
+{
+    if (keep_segments < 0)
+        keep_segments = 0;
+    if (replicas < 0)
+        replicas = 0;
+    if (replicas > LOOP_MAX_REPLICAS)
+        replicas = LOOP_MAX_REPLICAS;
+
+    l->retain_segments = keep_segments;
+    l->replicas_want = replicas;
+    l->retain_floor = 0;
+    l->retain_seen_segs = 0;
+    l->retain_failed = FALSE;
+}
+
+result_t loop_set_metrics_port(loop_t *l, err_t *e, uint32_t bind_ip,
+                               uint16_t port)
+{
+    sockaddr_in_t addr;
+    result_t      r;
+    int32_t       one = 1;
+
+    r = os_socket(e, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
+                  &l->metrics_fd);
+    if (!result_ok(r))
+        return r;
+
+    os_setsockopt(e, l->metrics_fd, SOL_SOCKET, SO_REUSEADDR, &one,
+                  (int32_t)sizeof(one));
+
+    mem_zero((uint8_t *)&addr, (int32_t)sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr = htonl(bind_ip);
+
+    r = os_bind(e, l->metrics_fd, &addr);
+    if (!result_ok(r))
+        goto fail;
+
+    r = os_listen(e, l->metrics_fd, 8);
+    if (!result_ok(r))
+        goto fail;
+
+    r = os_getsockname(e, l->metrics_fd, &addr);
+    if (!result_ok(r))
+        goto fail;
+    l->metrics_port = (int32_t)ntohs(addr.sin_port);
+
+    r = os_epoll_ctl(e, l->epoll_fd, EPOLL_CTL_ADD, l->metrics_fd, EPOLLIN,
+                     UD_MAKE(OP_METRICS, 0));
+    if (!result_ok(r))
+        goto fail;
+
+    return RESULT_OK;
+
+fail:
+    os_close(e, l->metrics_fd);
+    l->metrics_fd = -1;
+    return r;
+}
+
 void loop_shutdown(loop_t *l)
 {
     err_t   e;
@@ -2049,6 +2821,17 @@ void loop_shutdown(loop_t *l)
 
     err_init(&e);
     l->stop = TRUE;
+
+    for (i = 0; i < LOOP_MAX_SCRAPES; i++) {
+        if (l->scrapes[i].fd >= 0) {
+            os_close(&e, l->scrapes[i].fd);
+            l->scrapes[i].fd = -1;
+        }
+    }
+    if (l->metrics_fd >= 0) {
+        os_close(&e, l->metrics_fd);
+        l->metrics_fd = -1;
+    }
 
     for (i = 0; i < LOOP_MAX_CONNS; i++) {
         if (l->conns[i].in_use && l->conns[i].fd >= 0) {
