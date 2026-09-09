@@ -346,6 +346,29 @@ uint64_t wal_first_seq(const wal_t *w)
     return (w->seg_count > 0) ? w->seg_base[0] : 0;
 }
 
+int32_t wal_segments(const wal_t *w)
+{
+    return w->seg_count;
+}
+
+int64_t wal_seg_capacity(const wal_t *w)
+{
+    return w->seg_capacity;
+}
+
+uint64_t wal_retain_mark(const wal_t *w, int32_t keep_segments)
+{
+    if (!w || keep_segments <= 0 || w->seg_count <= keep_segments)
+        return 0;
+
+    /*
+     * The base of the oldest segment being kept. Everything below it
+     * lives in segments that are wholly older, which is the condition
+     * wal_retain checks for itself.
+     */
+    return w->seg_base[w->seg_count - keep_segments];
+}
+
 result_t wal_retain(wal_t *w, err_t *e, uint64_t keep_from, int32_t *removed_out)
 {
     int32_t  drop = 0;
@@ -531,6 +554,18 @@ result_t wal_cursor_read(wal_t *w, err_t *e, wal_cursor_t *c,
 
     if (!w || !c || !buf || !out_len || c->fd < 0) {
         ERR_PUSH(e, ERR_INVALID);
+        return RESULT_ERR(ERR_INVALID, 0);
+    }
+
+    /*
+     * Retention has been past here. The descriptor still reads, since
+     * an unlinked segment lives until it is closed, but the records
+     * after it are in segments the table no longer names and the walk
+     * below would end at that gap with nothing to report. Refusing is
+     * what tells the caller its reader is beyond repair.
+     */
+    if (c->next_seq < wal_first_seq(w)) {
+        ERR_PUSH_INT(e, ERR_INVALID, (int64_t)c->next_seq);
         return RESULT_ERR(ERR_INVALID, 0);
     }
 

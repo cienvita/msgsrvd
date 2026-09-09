@@ -107,6 +107,23 @@ uint64_t wal_next_seq(const wal_t *w);
 /* Lowest sequence still on disk. */
 uint64_t wal_first_seq(const wal_t *w);
 
+/* Segments on disk, the active one included. */
+int32_t wal_segments(const wal_t *w);
+
+/* Bytes each segment is preallocated to. */
+int64_t wal_seg_capacity(const wal_t *w);
+
+/*
+ * The keep_from that would leave the newest keep_segments in place, or
+ * 0 when the log is no longer than that and nothing can go.
+ *
+ * Segment boundaries are sequence boundaries, so this is a name in the
+ * table rather than anything read off the disk. It answers only what
+ * the count allows; a caller with another reason to keep more takes
+ * the lower of the two.
+ */
+uint64_t wal_retain_mark(const wal_t *w, int32_t keep_segments);
+
 /*
  * Delete whole segments that end before keep_from. The active segment
  * is never deleted, and neither is one holding any sequence at or
@@ -156,6 +173,12 @@ result_t wal_cursor_seek(wal_t *w, err_t *e, wal_cursor_t *c, uint64_t seq,
  * at the end of the written log, or when the next record would not
  * fit. Returns the bytes copied in out_len, 0 when there is nothing to
  * send, and advances the cursor past what it copied.
+ *
+ * ERR_INVALID when retention has taken the records the cursor stands
+ * on, which is the same answer wal_cursor_seek gives for the same
+ * position. Saying nothing instead would be indistinguishable from
+ * having caught up, and a reader left behind by retention would wait
+ * on a log that will never reach it again.
  *
  * Only whole records are copied. A caller streaming these to a replica
  * can hand on what it gets without having to say where the record
