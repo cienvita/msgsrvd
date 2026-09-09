@@ -543,6 +543,53 @@ static inline result_t os_eventfd(err_t *e, uint32_t initval, int32_t flags,
     return RESULT_OK;
 }
 
+/* ---- randomness ---- */
+
+/*
+ * Eight bytes from the kernel's pool.
+ *
+ * Blocking, which on any kernel this runs on means not blocking: the
+ * pool is initialised long before a service unit starts, and the only
+ * moment it would wait is a boot early enough that the node has
+ * nothing to serve anyway. A single-threaded loop cannot afford a wait
+ * it could avoid, and this is the one place where the alternative is
+ * worse: a weaker source than the kernel's, chosen to keep going.
+ *
+ * A refusal reports 0, which every caller has to read as "no number"
+ * rather than as the number zero.
+ */
+static inline uint64_t os_random_u64(void)
+{
+    uint64_t v = 0;
+    long     r = sys_call3(SYS_getrandom, (long)&v, (long)sizeof(v), 0);
+
+    if (sys_is_err(r) || r != (long)sizeof(v))
+        return 0;
+    return v;
+}
+
+/* ---- clock ---- */
+
+/*
+ * Monotonic nanoseconds. For measuring, never for naming: it has no
+ * relation to the wall clock and does not survive a reboot, which is
+ * what makes it safe to subtract.
+ *
+ * A clock that will not answer reports 0. There is nothing useful to
+ * do about that here, and every caller is a counter or a gauge, where
+ * a zero reads as a measurement that did not happen rather than as a
+ * wrong one.
+ */
+static inline uint64_t os_now_ns(void)
+{
+    timespec_t ts;
+    long       r = sys_call2(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&ts);
+
+    if (sys_is_err(r))
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* ---- timerfd ---- */
 
 static inline result_t os_timerfd(err_t *e, int32_t flags, int32_t *fd_out)

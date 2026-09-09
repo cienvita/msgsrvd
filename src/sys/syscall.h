@@ -41,6 +41,7 @@
 #define SYS_rmdir           84
 #define SYS_unlink          87
 #define SYS_getdents64      217
+#define SYS_clock_gettime   228
 #define SYS_epoll_wait      232
 #define SYS_epoll_ctl       233
 #define SYS_openat          257
@@ -52,6 +53,7 @@
 #define SYS_signalfd4       289
 #define SYS_eventfd2        290
 #define SYS_epoll_create1   291
+#define SYS_getrandom       318
 
 /* Raw syscall with 0-6 arguments */
 static inline long sys_call0(long n)
