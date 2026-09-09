@@ -88,7 +88,7 @@ read off its files.
 
 ## Running
 
-    msgsrvd --dir PATH [--port N] [--segment-size BYTES]
+    msgsrvd --dir PATH [--bind ADDR] [--port N] [--segment-size BYTES]
             [--leader ADDR:PORT] [--retain-segments N] [--replicas N]
             [--metrics-port N]
 
@@ -96,6 +96,13 @@ Serves the write-ahead log in PATH, which must already exist. Port
 defaults to 7400 and segments to 256 MiB. SIGINT or SIGTERM stops the
 loop at the end of the pass that receives it, so a shutdown never
 lands between an append and the flush that makes it durable.
+
+`--bind` is the one address the node listens on, and the metrics port
+takes the same one. It defaults to 127.0.0.1, so a node anything else
+has to reach must be given an address, and that address is numeric
+because there is no resolver here. The port carries client writes and
+the replication stream both, which is why it belongs on a private
+interface rather than on every one.
 
 `--retain-segments` is how many segments the node keeps, and without
 it the log grows for ever. A node also keeps whatever the replicas
