@@ -47,9 +47,10 @@ always zero.
 
 **Everything is an append.** There is no update, and DELETE is a verb
 that answers "not built". Nothing compacts, so the current value for a
-key is whatever its history says, read back; nothing queries a payload,
-because nothing parses one; and retention exists in the WAL but nothing
-calls it, so a running node grows without bound.
+key is whatever its history says, read back, and nothing queries a
+payload, because nothing parses one. What bounds a node is retention,
+which deletes whole segments off the back of the log once nothing
+needs them.
 
 That suits a log of things that happened: entries in a ledger, state
 changes to be replayed, work to be consumed in order, a feed for other
@@ -76,7 +77,9 @@ exceptions or longjmp, every syscall returns a structured result.
 
 Wire protocol. Fixed 32-byte header, little-endian, memcpy-decoded.
 Small fixed verb set: WRITE, READ, DELETE, SUBSCRIBE, NOTIFY, ACK, ERR,
-PING, PONG, HELLO, and three more for the replication stream.
+PING, PONG, HELLO, and three more for the replication stream. The
+metrics port is the one thing that does not speak it, and the least
+HTTP that a scraper accepts is all it speaks instead.
 
 Nothing asks a node about itself. There is no verb for what a node is,
 whether it leads, or what keys it holds, so a client finds out that it
@@ -86,12 +89,29 @@ read off its files.
 ## Running
 
     msgsrvd --dir PATH [--port N] [--segment-size BYTES]
-            [--leader ADDR:PORT]
+            [--leader ADDR:PORT] [--retain-segments N] [--replicas N]
+            [--metrics-port N]
 
 Serves the write-ahead log in PATH, which must already exist. Port
 defaults to 7400 and segments to 256 MiB. SIGINT or SIGTERM stops the
 loop at the end of the pass that receives it, so a shutdown never
 lands between an append and the flush that makes it durable.
+
+`--retain-segments` is how many segments the node keeps, and without
+it the log grows for ever. A node also keeps whatever the replicas
+named by `--replicas` have not yet confirmed, whichever is more, so a
+leader expecting replicas that are not all attached deletes nothing.
+`--replicas` says nothing on a replica, which has nothing downstream
+of it, and is ignored there rather than refused, so one set of flags
+serves every node. Sizing is arithmetic the operator does: segments
+times segment size is the volume, and it has to hold the window a
+replica may be away for.
+
+`--metrics-port` opens a second listener that answers any HTTP request
+with the node's counters in Prometheus text format. It is off unless
+asked for. What it reports is the log's sequences and size, per
+replica what has been confirmed and how long ago, acknowledgements and
+refusals by kind, and a histogram of flush latency.
 
 With `--leader` the node is a replica: it dials that address, asks for
 the first sequence it does not hold, and writes what it is sent.
@@ -128,6 +148,35 @@ restart is told the highest sequence the log holds for it and resends
 from there, and anything at or below that mark is acknowledged rather
 than stored again.
 
+An id is drawn from the kernel rather than counted up, which is what
+lets the table be derived and still be safe. A counter would have to
+remember what it had already issued, and the only place to remember
+that which survives both retention and a promotion is the log, meaning
+a record format for it and a flush before any id could be handed out.
+Drawing needs neither. A draw is checked against the sessions the node
+holds, so a collision would have to be with one that exists only in
+the log, at odds far longer than the checksum this log already trusts
+to tell a good record from a corrupted one.
+
+What retention does reach is the table. A session whose records have
+all been deleted leaves nothing for the scan to count, so a restart
+forgets it, and a client resuming it is told the session is unknown
+rather than answered from a mark that is no longer there. It opens a
+new session and resends, which is what an expired one gets too.
+
+Retention deletes whole segments, and only ones the node has no reason
+to keep: below the count it was given, and below what every replica it
+expects has confirmed. A reader standing where retention has been is
+refused rather than left waiting, which is the difference between
+being told the history is gone and being told nothing at all.
+
+Metrics are a second listener that answers any HTTP request with one
+Prometheus text document and closes. It never interprets the request,
+only finds where the head ends, and it has its own connection slots so
+a stuck scraper cannot take one a client needs. A document that would
+not fit the buffer is refused rather than cut short, since a metric
+missing from a scrape reads as one that never existed.
+
 Replication is a stream and an acknowledgement. The replica names the
 sequence it wants, the leader sends whole records from its log, and
 the replica answers with what its own flush has covered. A write
@@ -154,9 +203,8 @@ particular deployment, so it is kept with the deployment rather than
 here. Four of the five bugs listed in this repository's history came
 out of it.
 
-Not built yet. Metrics: there is no endpoint, so nothing watches
-replication lag or acknowledgement latency, and nothing alerts.
-Automatic failover: losing the leader needs an operator and a runbook,
-which lives with the deployment rather than here. Retention, written
-and never called. DELETE, which no projector defines. And this has not
-been deployed anywhere yet.
+Not built yet. Automatic failover: losing the leader needs an operator
+and a runbook, which lives with the deployment rather than here.
+Backups: the segments are the backup and nothing copies them off the
+node. DELETE, which no projector defines. And this has not been
+deployed anywhere yet.
